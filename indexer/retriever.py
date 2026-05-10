@@ -1,10 +1,9 @@
-"""RAG 查询模块：混合检索（语义 + BM25） + LLM 回答"""
+"""RAG 查询模块：混合检索（语义 + BM25 + 路径加权） + LLM 回答"""
 from __future__ import annotations
 
 import json
 import logging
 from functools import lru_cache
-from pathlib import Path
 from typing import List, Optional
 
 import httpx
@@ -35,7 +34,7 @@ def embed_query(query: str) -> List[float]:
     return resp.json()["data"][0]["embedding"]
 
 
-# ── BM25 本地检索 ──
+# ── BM25 本地检索（jieba 分词）──
 
 import jieba
 from rank_bm25 import BM25Okapi
@@ -58,10 +57,8 @@ def _load_bm25_index():
         for line in f:
             record = json.loads(line)
             chunks.append(record)
-            # 取 text 字段做分词
             texts.append(record["text"])
 
-    # jieba 分词
     tokenized = [list(jieba.cut(t)) for t in texts]
     bm25 = BM25Okapi(tokenized)
 
@@ -79,7 +76,6 @@ def bm25_search(query: str, top_k: int = 20) -> List[dict]:
     query_tokens = list(jieba.cut(query))
     scores = bm25.get_scores(query_tokens)
 
-    # 取 top_k 的索引
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
 
     results = []
@@ -152,22 +148,18 @@ def semantic_search(
 def rrf_fuse(
     semantic_results: List[dict],
     bm25_results: List[dict],
-    k: int = 60,
+    k: int = 30,
     semantic_weight: float = 1.0,
-    bm25_weight: float = 1.0,
-    top_k: int = 5,
+    bm25_weight: float = 2.0,
+    top_k: int = 20,
 ) -> List[dict]:
     """
-    Reciprocal Rank Fusion 融合两路结果。
-
+    Reciproral Rank Fusion 融合语义 + BM25 两路结果。
     RRF score = Σ weight / (k + rank)
-    k=60 是论文推荐值。
     """
-    # 用 source_file + chunk_index 做去重 key
     def _key(r):
         return (r.get("source_file", ""), r.get("chunk_index", 0))
 
-    # 收集两路各自的 key 集合
     sem_keys = set()
     bm25_keys = set()
     rrf_scores: dict[tuple, float] = {}
@@ -187,25 +179,43 @@ def rrf_fuse(
         if key not in merged:
             merged[key] = r
 
-    # 仅 BM25 命中（语义未命中）的结果额外加权：+20%
-    # 这些是关键词精确匹配但语义漂移的文档，往往是真正相关的
-    bm25_only_boost = 1.2
+    # 仅 BM25 命中的结果额外 +20%（关键词精确匹配但语义漂移）
     for key in bm25_keys - sem_keys:
-        rrf_scores[key] *= bm25_only_boost
+        rrf_scores[key] *= 1.2
 
-    # 按 RRF 分数排序
     sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
 
     results = []
     for key in sorted_keys[:top_k]:
         r = merged[key].copy()
         r["score"] = rrf_scores[key]
-        # 去掉内部字段
         r.pop("bm25_score", None)
         r.pop("semantic_score", None)
         r.pop("chunk_index", None)
         results.append(r)
 
+    return results
+
+
+# ── 路径加权 ──
+
+_STOPWORDS = frozenset(('怎么', '如何', '什么', '创建', '使用', '实现', '的', '了', '和', '与', '或', '在', '是', '有', '一个', '几个', '用来', '还有'))
+
+
+def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) -> List[dict]:
+    """
+    路径/标题加权：query 分词后，关键词在 source_file 或 context 中出现则加权。
+    """
+    query_tokens = list(jieba.cut(query))
+    query_keywords = [t for t in query_tokens if len(t) >= 2 and t not in _STOPWORDS]
+
+    for r in results:
+        path_text = r.get("source_file", "") + " " + r.get("context", "")
+        match_count = sum(1 for w in query_keywords if w in path_text)
+        if match_count > 0:
+            r["score"] *= (1 + boost_per_match * match_count)
+
+    results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
 
@@ -219,12 +229,12 @@ def search(
     method: str = "hybrid",
 ) -> List[dict]:
     """
-    混合检索：语义 + BM25，RRF 融合。
+    混合检索。
 
     method:
-        "hybrid"   - 语义 + BM25 融合（默认）
-        "semantic" - 纯语义
-        "bm25"     - 纯 BM25
+        "hybrid"    - BM25 + 语义 RRF 融合 + 路径加权（默认，推荐）
+        "semantic"  - 纯语义
+        "bm25"      - 纯 BM25
     """
     if method == "semantic":
         return _semantic_only(query, top_k, category, has_code)
@@ -251,7 +261,9 @@ def _bm25_only(query, top_k) -> List[dict]:
 
 
 def _hybrid_search(query, top_k, category, has_code) -> List[dict]:
-    """混合检索：语义 + BM25 + 路径加权。"""
+    """
+    混合检索：BM25 + 语义 RRF 融合 + 路径加权。
+    """
     candidate_k = max(top_k * 4, 20)
 
     sem_results = semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
@@ -267,20 +279,9 @@ def _hybrid_search(query, top_k, category, has_code) -> List[dict]:
         top_k=candidate_k,
     )
 
-    # 路径/标题加权：用 jieba 分词后，query 关键词在 source_file 或 context 中出现则加权
-    import jieba as _jieba
-    query_tokens = list(_jieba.cut(query))
-    # 去掉停用词和过短的词
-    query_keywords = [t for t in query_tokens if len(t) >= 2 and t not in ('怎么', '如何', '什么', '创建', '使用', '实现')]
+    # 路径加权
+    fused = path_boost(fused, query)
 
-    for r in fused:
-        path_text = r.get("source_file", "") + " " + r.get("context", "")
-        match_count = sum(1 for w in query_keywords if w in path_text)
-        if match_count > 0:
-            r["score"] *= (1 + 0.8 * match_count)  # 每命中一个词 +80%
-
-    # 重新排序
-    fused.sort(key=lambda r: r["score"], reverse=True)
     return fused[:top_k]
 
 
