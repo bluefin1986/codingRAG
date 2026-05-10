@@ -10,12 +10,16 @@ import httpx
 from tqdm import tqdm
 
 from config import (
+    ACTIVE_DOMAIN,
     CHUNKS_FILE,
     COLLECTION_NAME,
     EMBEDDING_API_BASE,
     EMBEDDING_MODEL_NAME,
+    PROMPT_ROLE,
     QDRANT_HOST,
     QDRANT_PORT,
+    RERANK_API_BASE,
+    RERANK_MODEL_NAME,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +95,7 @@ def bm25_search(query: str, top_k: int = 20) -> List[dict]:
         meta = record.get("metadata", {})
         results.append({
             "bm25_score": float(scores[idx]),
+            "domain": meta.get("domain", ACTIVE_DOMAIN),
             "text": record["text"],
             "context": meta.get("context", ""),
             "source_file": meta.get("source_file", ""),
@@ -113,6 +118,7 @@ def semantic_search(
     query_vector = embed_query(query)
 
     must_filters = []
+    # 默认靠 domain 对应 collection 隔离；payload 仍写入 domain，便于后续共享 collection 时过滤。
     if category:
         must_filters.append({"key": "category", "match": {"value": category}})
     if has_code is not None:
@@ -139,6 +145,7 @@ def semantic_search(
     for hit in resp.json()["result"]:
         results.append({
             "semantic_score": hit["score"],
+            "domain": hit["payload"].get("domain", ACTIVE_DOMAIN),
             "text": hit["payload"]["text"],
             "context": hit["payload"].get("context", ""),
             "source_file": hit["payload"].get("source_file", ""),
@@ -240,11 +247,15 @@ def search(
         "hybrid"    - BM25 + 语义 RRF 融合 + 路径加权（默认，推荐）
         "semantic"  - 纯语义
         "bm25"      - 纯 BM25
+        "rerank"    - hybrid 后调用当前 domain 对应 rerank 模型重排
     """
     if method == "semantic":
         return _semantic_only(query, top_k, category, has_code)
     elif method == "bm25":
         return _bm25_only(query, top_k)
+    elif method in ("rerank", "hybrid_rerank"):
+        candidates = _hybrid_search(query, max(top_k * 4, 20), category, has_code)
+        return rerank_results(query, candidates, top_k=top_k)
     else:
         return _hybrid_search(query, top_k, category, has_code)
 
@@ -290,6 +301,42 @@ def _hybrid_search(query, top_k, category, has_code) -> List[dict]:
     return fused[:top_k]
 
 
+# ── Rerank ──
+
+def rerank_results(query: str, results: List[dict], top_k: int = 5) -> List[dict]:
+    """调用 aimodels rerank 接口，对候选文档重排。"""
+    if not results:
+        return []
+
+    documents = [r["text"] for r in results]
+    client = httpx.Client(timeout=120.0)
+    resp = client.post(
+        f"{RERANK_API_BASE}/api/v1/rerank",
+        json={
+            "query": query,
+            "documents": documents,
+            "top_k": min(top_k, len(documents)),
+            "return_documents": False,
+            # 当前 aimodels rerank endpoint 使用默认模型；这里保留字段，便于后续支持多 rerank 路由。
+            "model": RERANK_MODEL_NAME,
+        },
+    )
+    resp.raise_for_status()
+    client.close()
+
+    items = resp.json().get("items") or resp.json().get("data", {}).get("items", [])
+    reranked: List[dict] = []
+    for item in items:
+        idx = item["index"]
+        if 0 <= idx < len(results):
+            r = results[idx].copy()
+            r["rerank_score"] = float(item["score"])
+            r["score"] = float(item["score"])
+            r["rerank_model"] = RERANK_MODEL_NAME
+            reranked.append(r)
+    return reranked
+
+
 # ── Prompt 构建 ──
 
 def format_context(results: List[dict]) -> str:
@@ -313,7 +360,7 @@ def rag_query(
     results = search(question, top_k=top_k, category=category, has_code=has_code, method=method)
     context = format_context(results)
 
-    prompt = f"""你是鸿蒙开发专家。基于以下参考文档回答用户问题。
+    prompt = f"""你是{PROMPT_ROLE}。基于以下参考文档回答用户问题。
 
 参考文档：
 {context}
@@ -344,6 +391,9 @@ if __name__ == "__main__":
     result = rag_query(question, top_k=top_k, method=method)
 
     print(f"\n问题: {result['question']}")
+    print(f"领域: {ACTIVE_DOMAIN}")
+    print(f"Embedding: {EMBEDDING_MODEL_NAME}")
+    print(f"Rerank: {RERANK_MODEL_NAME}")
     print(f"检索方法: {method}")
     print(f"检索到 {len(result['results'])} 个相关文档:\n")
     for i, r in enumerate(result["results"], 1):

@@ -3,35 +3,40 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+
+# Allow running as: python3 indexer/qdrant_indexer.py
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import httpx
 from tqdm import tqdm
 
 from config import (
+    ACTIVE_DOMAIN,
     CHUNKS_FILE,
     COLLECTION_NAME,
+    DOMAIN_REGISTRY,
     EMBEDDING_API_BASE,
     EMBEDDING_DIM,
     EMBEDDING_MODEL_NAME,
+    NOISE_PATTERNS as NOISE_PATTERN_STRINGS,
     OUTPUT_DIR,
     QDRANT_HOST,
     QDRANT_PORT,
+    RERANK_MODEL_NAME,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── 噪声清洗 ──
-NOISE_PATTERNS = [
-    re.compile(r"收起自动换行深色代码主题复制\s*"),
-    re.compile(r"\[外链图片[^\]]*\]"),
-    re.compile(r"!\[image\]\([^\)]*\)"),
-    re.compile(r"https://alliance-communityfile[^\s]*"),
-    re.compile(r"https://developer\.huawei\.com/consumer/cn/doc/[^\s\)]*"),
-]
+NOISE_PATTERNS = [re.compile(pattern) for pattern in NOISE_PATTERN_STRINGS]
 
 
 def clean_text(text: str) -> str:
@@ -44,7 +49,7 @@ def clean_text(text: str) -> str:
 
 
 def truncate_text(text: str, max_chars: int = 1500) -> str:
-    """预截断文本（bge-large max_length=512 tokens，约 1500 中文字符）。"""
+    """预截断 embedding 输入；payload 保留完整文本。"""
     if len(text) <= max_chars:
         return text
     return text[:max_chars]
@@ -178,6 +183,7 @@ def build_points(chunks: List[dict], embeddings: List[List[float]]) -> List[dict
     ):
         meta = chunk["metadata"]
         payload = {
+            "domain": ACTIVE_DOMAIN,
             "text": chunk["text"],
             "context": meta.get("context", ""),
             "source_file": meta.get("source_file", ""),
@@ -255,9 +261,11 @@ def run_indexing(
         "payload_text_truncated": False,
         "embed_time_seconds": round(embed_time, 1),
         "upsert_time_seconds": round(upsert_time, 1),
+        "domain": ACTIVE_DOMAIN,
         "collection": COLLECTION_NAME,
         "embedding_dim": EMBEDDING_DIM,
         "embedding_model": EMBEDDING_MODEL_NAME,
+        "rerank_model": RERANK_MODEL_NAME,
     }
 
     stats_path = OUTPUT_DIR / "index_stats.json"
@@ -274,10 +282,25 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Embed chunks and index into Qdrant")
-    parser.add_argument("--recreate", action="store_true", help="Recreate Qdrant collection")
+    parser.add_argument("--domain", choices=sorted(DOMAIN_REGISTRY), default=ACTIVE_DOMAIN, help="Domain/language index to build")
+    parser.add_argument("--recreate", action="store_true", help="Recreate the selected domain's Qdrant collection")
     parser.add_argument("--batch-size", type=int, default=32, help="Embedding batch size")
     parser.add_argument("--qdrant-batch", type=int, default=100, help="Qdrant upsert batch size")
     args = parser.parse_args()
+
+    if args.domain != ACTIVE_DOMAIN:
+        env = os.environ.copy()
+        env["CODING_RAG_DOMAIN"] = args.domain
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    logging.info(
+        "indexing domain=%s collection=%s embedding=%s rerank=%s chunks=%s",
+        ACTIVE_DOMAIN,
+        COLLECTION_NAME,
+        EMBEDDING_MODEL_NAME,
+        RERANK_MODEL_NAME,
+        CHUNKS_FILE,
+    )
 
     stats = run_indexing(
         recreate=args.recreate,

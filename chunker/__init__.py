@@ -1,5 +1,5 @@
 """
-HarmonyRAG Markdown 智能分块模块
+codingRAG Markdown 智能分块模块
 
 导出：
 - chunk_document(filepath, content) → List[Chunk]

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-HarmonyRAG 分块流水线
+codingRAG 分块流水线
 
 扫描文档目录，对所有 .md 文件执行语义分块，输出 JSONL 和统计信息。
+
+支持两种输入布局：
+1. guides/references 双目录结构（原 HarmonyOS 文档）
+2. 单目录 markdown 平铺结构（如 iOS apple-docs-md 输出）
 
 用法：
     python pipeline.py
@@ -17,7 +21,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from config import GUIDES_DIR, REFERENCES_DIR, OUTPUT_DIR, CHUNK_MAX_TOKENS, CHUNK_MIN_TOKENS, CHUNK_OVERLAP_TOKENS
+from config import ACTIVE_DOMAIN, DOCS_DIR, GUIDES_DIR, REFERENCES_DIR, OUTPUT_DIR, CHUNK_MAX_TOKENS, CHUNK_MIN_TOKENS, CHUNK_OVERLAP_TOKENS
 from chunker import chunk_directory
 
 
@@ -30,13 +34,22 @@ def main() -> None:
     stats_path = OUTPUT_DIR / "stats.json"
 
     # ── 2. 扫描并分块 ──
+    print(f"🧭 domain={ACTIVE_DOMAIN} docs_dir={DOCS_DIR}")
     all_chunks = []
     file_count = 0
 
-    scan_targets = [
-        (GUIDES_DIR, "guides"),
-        (REFERENCES_DIR, "references"),
-    ]
+    # 兼容两种布局：
+    # - guides/references
+    # - 单目录 markdown 平铺
+    if GUIDES_DIR.is_dir() or REFERENCES_DIR.is_dir():
+        scan_targets = [
+            (GUIDES_DIR, "guides"),
+            (REFERENCES_DIR, "references"),
+        ]
+    else:
+        scan_targets = [
+            (DOCS_DIR, "docs"),
+        ]
 
     for dir_path, category in scan_targets:
         if not dir_path.is_dir():
@@ -93,6 +106,8 @@ def main() -> None:
     elapsed = time.time() - start_time
 
     stats = {
+        "domain": ACTIVE_DOMAIN,
+        "docs_dir": str(DOCS_DIR),
         "total_files": file_count,
         "total_chunks": len(all_chunks),
         "chunks_with_code": code_chunks,

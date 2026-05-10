@@ -1,28 +1,110 @@
-"""HarmonyRAG 配置"""
-from pathlib import Path
+"""codingRAG 配置：按领域/语言注册 docs、collection、embedding、rerank。"""
+from __future__ import annotations
 
-# ── 路径 ──
-PROJECT_ROOT = Path(__file__).parent
-DOCS_DIR = PROJECT_ROOT.parent / "harmonyos-docs-fetcher" / "harmonyos-docs-full"
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+# ── 服务 ──
+QDRANT_HOST = os.getenv("CODING_RAG_QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("CODING_RAG_QDRANT_PORT", "6333"))
+AIMODELS_API_BASE = os.getenv("CODING_RAG_AIMODELS_API_BASE", "http://localhost:8030")
+EMBEDDING_API_BASE = os.getenv("CODING_RAG_EMBEDDING_API_BASE", AIMODELS_API_BASE)
+RERANK_API_BASE = os.getenv("CODING_RAG_RERANK_API_BASE", AIMODELS_API_BASE)
+
+# ── 领域/语言注册表 ──
+# 新增语言/技术栈时，只需要在这里加一个 entry。
+DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "harmonyos": {
+        "display_name": "HarmonyOS / ArkTS",
+        "language": "ArkTS",
+        "docs_dir": PROJECT_ROOT.parent / "harmonyos-docs-fetcher" / "harmonyos-docs-full",
+        "collection": "harmonyos_docs",
+        "embedding_model": "BAAI/bge-large-zh-v1.5",
+        "embedding_model_name": "bge-large-zh-v1.5",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "鸿蒙开发专家",
+        "noise_patterns": [
+            r"收起自动换行深色代码主题复制\s*",
+            r"\[外链图片[^\]]*\]",
+            r"!\[image\]\([^\)]*\)",
+            r"https://alliance-communityfile[^\s]*",
+            r"https://developer\.huawei\.com/consumer/cn/doc/[^\s\)]*",
+        ],
+    },
+    "ios": {
+        "display_name": "iOS / UIKit / Objective-C",
+        "language": "Objective-C",
+        "docs_dir": PROJECT_ROOT.parent / "ios-docs" / "uikit",
+        "collection": "ios_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "iOS UIKit / Objective-C 开发专家",
+        "noise_patterns": [
+            r'title: "This page requires JavaScript\."\n',
+            r"(?m)^- \[Documentation\]\([^\)]*\)\s*$",
+        ],
+    },
+}
+
+DEFAULT_DOMAIN = "ios"
+ACTIVE_DOMAIN = os.getenv("CODING_RAG_DOMAIN", DEFAULT_DOMAIN).strip().lower()
+if ACTIVE_DOMAIN not in DOMAIN_REGISTRY:
+    known = ", ".join(sorted(DOMAIN_REGISTRY))
+    raise ValueError(f"Unknown CODING_RAG_DOMAIN={ACTIVE_DOMAIN!r}; known domains: {known}")
+
+
+def get_domain_config(domain: str | None = None) -> Dict[str, Any]:
+    """返回指定领域配置，环境变量可覆盖常用字段。"""
+    name = (domain or ACTIVE_DOMAIN).strip().lower()
+    if name not in DOMAIN_REGISTRY:
+        known = ", ".join(sorted(DOMAIN_REGISTRY))
+        raise ValueError(f"Unknown domain={name!r}; known domains: {known}")
+
+    cfg = dict(DOMAIN_REGISTRY[name])
+    prefix = f"CODING_RAG_{name.upper()}_"
+
+    cfg["domain"] = name
+    cfg["docs_dir"] = _path(os.getenv(prefix + "DOCS_DIR", os.getenv("CODING_RAG_DOCS_DIR", str(cfg["docs_dir"]))))
+    cfg["collection"] = os.getenv(prefix + "COLLECTION", os.getenv("CODING_RAG_COLLECTION_NAME", cfg["collection"]))
+    cfg["embedding_model_name"] = os.getenv(prefix + "EMBEDDING_MODEL_NAME", cfg["embedding_model_name"])
+    cfg["embedding_model"] = os.getenv(prefix + "EMBEDDING_MODEL", cfg["embedding_model"])
+    cfg["embedding_dim"] = int(os.getenv(prefix + "EMBEDDING_DIM", str(cfg["embedding_dim"])))
+    cfg["rerank_model_name"] = os.getenv(prefix + "RERANK_MODEL_NAME", cfg["rerank_model_name"])
+    cfg["prompt_role"] = os.getenv(prefix + "PROMPT_ROLE", cfg["prompt_role"])
+    cfg["noise_patterns"] = cfg.get("noise_patterns", [])
+    cfg["output_dir"] = _path(os.getenv(prefix + "OUTPUT_DIR", os.getenv("CODING_RAG_OUTPUT_DIR", str(PROJECT_ROOT / "output" / name))))
+    return cfg
+
+
+ACTIVE_DOMAIN_CONFIG = get_domain_config()
+
+# ── 当前活动领域的兼容导出 ──
+DOCS_DIR = ACTIVE_DOMAIN_CONFIG["docs_dir"]
 GUIDES_DIR = DOCS_DIR / "guides"
 REFERENCES_DIR = DOCS_DIR / "references"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = ACTIVE_DOMAIN_CONFIG["output_dir"]
+CHUNKS_FILE = OUTPUT_DIR / "chunks.jsonl"
 
-# ── Qdrant ──
-QDRANT_HOST = "localhost"
-QDRANT_PORT = 6333
-COLLECTION_NAME = "harmonyos_docs"
-
-# ── Embedding ──
-EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
-EMBEDDING_DIM = 1024
-EMBEDDING_API_BASE = "http://localhost:8030"  # aimodels 服务地址
-EMBEDDING_MODEL_NAME = "bge-large-zh-v1.5"    # API 调用时的 model name
+COLLECTION_NAME = ACTIVE_DOMAIN_CONFIG["collection"]
+EMBEDDING_MODEL = ACTIVE_DOMAIN_CONFIG["embedding_model"]
+EMBEDDING_MODEL_NAME = ACTIVE_DOMAIN_CONFIG["embedding_model_name"]
+EMBEDDING_DIM = ACTIVE_DOMAIN_CONFIG["embedding_dim"]
+RERANK_MODEL_NAME = ACTIVE_DOMAIN_CONFIG["rerank_model_name"]
+PROMPT_ROLE = ACTIVE_DOMAIN_CONFIG["prompt_role"]
+NOISE_PATTERNS = ACTIVE_DOMAIN_CONFIG.get("noise_patterns", [])
 
 # ── Chunking ──
-CHUNK_MAX_TOKENS = 800
-CHUNK_MIN_TOKENS = 200
-CHUNK_OVERLAP_TOKENS = 100
-
-# ── 输出 ──
-CHUNKS_FILE = OUTPUT_DIR / "chunks.jsonl"
+CHUNK_MAX_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MAX_TOKENS", "800"))
+CHUNK_MIN_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MIN_TOKENS", "200"))
+CHUNK_OVERLAP_TOKENS = int(os.getenv("CODING_RAG_CHUNK_OVERLAP_TOKENS", "100"))
