@@ -1,0 +1,10 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15.3
+    container_name: harmony-rag-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - /Volumes/BDisk/bizData/qdrant:/qdrant/storage
+    restart: unless-stopped
