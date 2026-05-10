@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import List, Optional
 
 import httpx
+from tqdm import tqdm
 
 from config import (
     CHUNKS_FILE,
@@ -54,12 +55,16 @@ def _load_bm25_index():
     chunks = []
     texts = []
     with open(chunks_path, encoding="utf-8") as f:
-        for line in f:
+        for line in tqdm(f, desc="BM25 loading chunks", unit="chunk"):
             record = json.loads(line)
             chunks.append(record)
             texts.append(record["text"])
 
-    tokenized = [list(jieba.cut(t)) for t in texts]
+    tokenized = [
+        list(jieba.cut(t))
+        for t in tqdm(texts, desc="BM25 tokenizing", unit="chunk")
+    ]
+    logger.info("building BM25 index from %d tokenized chunks ...", len(tokenized))
     bm25 = BM25Okapi(tokenized)
 
     elapsed = time.time() - t0

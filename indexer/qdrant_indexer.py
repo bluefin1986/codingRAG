@@ -52,13 +52,22 @@ def truncate_text(text: str, max_chars: int = 1500) -> str:
 
 # ── Embedding API ──
 def embed_texts(texts: List[str], batch_size: int = 32, max_retries: int = 3) -> List[List[float]]:
-    """调用 aimodels 服务批量生成 embedding，带重试。"""
+    """调用 aimodels 服务批量生成 embedding，带重试和进度显示。"""
     import time as _time
     all_embeddings: List[List[float]] = []
     client = httpx.Client(timeout=900.0)
 
-    for i in range(0, len(texts), batch_size):
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    progress = tqdm(
+        range(0, len(texts), batch_size),
+        total=total_batches,
+        desc="Embedding",
+        unit="batch",
+    )
+
+    for batch_no, i in enumerate(progress, 1):
         batch = texts[i : i + batch_size]
+        progress.set_postfix({"vectors": len(all_embeddings), "batch_size": len(batch)})
         for attempt in range(max_retries):
             try:
                 resp = client.post(
@@ -72,7 +81,14 @@ def embed_texts(texts: List[str], batch_size: int = 32, max_retries: int = 3) ->
             except (httpx.ReadTimeout, httpx.ConnectError) as exc:
                 if attempt < max_retries - 1:
                     wait = 5 * (attempt + 1)
-                    logger.warning("batch %d attempt %d failed: %s, retrying in %ds", i // batch_size, attempt + 1, exc, wait)
+                    logger.warning(
+                        "embedding batch %d/%d attempt %d failed: %s, retrying in %ds",
+                        batch_no,
+                        total_batches,
+                        attempt + 1,
+                        exc,
+                        wait,
+                    )
                     _time.sleep(wait)
                 else:
                     raise
@@ -122,7 +138,15 @@ def upsert_points(
     url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{COLLECTION_NAME}/points"
     total_written = 0
 
-    for i in range(0, len(points), batch_size):
+    total_batches = (len(points) + batch_size - 1) // batch_size
+    progress = tqdm(
+        range(0, len(points), batch_size),
+        total=total_batches,
+        desc="Qdrant upsert",
+        unit="batch",
+    )
+
+    for i in progress:
         batch = points[i : i + batch_size]
         resp = client.put(
             url,
@@ -131,6 +155,7 @@ def upsert_points(
         )
         resp.raise_for_status()
         total_written += len(batch)
+        progress.set_postfix({"written": total_written, "batch_size": len(batch)})
 
     return total_written
 
@@ -140,7 +165,7 @@ def load_chunks(filepath: Path) -> List[dict]:
     """加载 chunks.jsonl。"""
     chunks = []
     with open(filepath) as f:
-        for line in f:
+        for line in tqdm(f, desc="Loading chunks", unit="chunk"):
             chunks.append(json.loads(line))
     return chunks
 
@@ -148,7 +173,9 @@ def load_chunks(filepath: Path) -> List[dict]:
 def build_points(chunks: List[dict], embeddings: List[List[float]]) -> List[dict]:
     """构建 Qdrant point 列表。"""
     points = []
-    for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for idx, (chunk, embedding) in enumerate(
+        tqdm(zip(chunks, embeddings), total=len(chunks), desc="Building points", unit="point")
+    ):
         meta = chunk["metadata"]
         payload = {
             "text": chunk["text"],
@@ -184,20 +211,21 @@ def run_indexing(
 
     # 2. 清洗文本
     logger.info("cleaning text...")
-    for chunk in chunks:
+    for chunk in tqdm(chunks, desc="Cleaning text", unit="chunk"):
         chunk["text"] = clean_text(chunk["text"])
-
-    # 预截断长文本（模型 max_length=512 tokens，超长的会被截断白费处理时间）
-    for chunk in chunks:
-        chunk["text"] = truncate_text(chunk["text"])
 
     # 过滤掉清洗后为空的 chunk
     valid_chunks = [c for c in chunks if c["text"].strip()]
     logger.info("valid chunks after cleaning: %d (filtered %d)", len(valid_chunks), len(chunks) - len(valid_chunks))
 
     # 3. Embedding
+    # 注意：只截断 embedding 输入，不截断 payload text。
+    # payload 需要保留完整 chunk，避免长代码示例被写入 Qdrant 时切掉一半。
     logger.info("generating embeddings (batch_size=%d) ...", embed_batch_size)
-    texts = [c["text"] for c in valid_chunks]
+    texts = [truncate_text(c["text"]) for c in valid_chunks]
+    truncated_for_embedding = sum(1 for c in valid_chunks if len(c["text"]) > len(truncate_text(c["text"])))
+    if truncated_for_embedding:
+        logger.info("truncated %d chunks for embedding input only; payload text remains full", truncated_for_embedding)
     t0 = time.time()
     embeddings = embed_texts(texts, batch_size=embed_batch_size)
     embed_time = time.time() - t0
@@ -223,6 +251,8 @@ def run_indexing(
         "total_chunks": len(chunks),
         "valid_chunks": len(valid_chunks),
         "filtered_out": len(chunks) - len(valid_chunks),
+        "truncated_for_embedding": truncated_for_embedding,
+        "payload_text_truncated": False,
         "embed_time_seconds": round(embed_time, 1),
         "upsert_time_seconds": round(upsert_time, 1),
         "collection": COLLECTION_NAME,
