@@ -85,10 +85,36 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
         _BM25_CACHE[domain] = (None, [])
         return None, []
 
-    tokenized = [list(jieba.cut(t)) for t in texts]
+    logger.info("BM25 tokenizing start for domain %s: %d chunks", domain, len(texts))
+    t_tokenize = time.time()
+    tokenized = []
+    for i, text in enumerate(texts, 1):
+        tokenized.append(list(jieba.cut(text)))
+        if i % 10000 == 0 or i == len(texts):
+            logger.info(
+                "BM25 tokenizing progress domain=%s chunks=%d/%d elapsed=%.1fs",
+                domain,
+                i,
+                len(texts),
+                time.time() - t_tokenize,
+            )
+
+    logger.info(
+        "BM25 building index start for domain %s: %d tokenized chunks tokenized_elapsed=%.1fs",
+        domain,
+        len(tokenized),
+        time.time() - t_tokenize,
+    )
+    t_build = time.time()
     bm25 = BM25Okapi(tokenized)
     elapsed = time.time() - t0
-    logger.info("BM25 index loaded for domain %s: %d chunks in %.1fs", domain, len(chunks), elapsed)
+    logger.info(
+        "BM25 index loaded for domain %s: %d chunks in %.1fs build_elapsed=%.1fs",
+        domain,
+        len(chunks),
+        elapsed,
+        time.time() - t_build,
+    )
 
     _BM25_CACHE[domain] = (bm25, chunks)
     return bm25, chunks
