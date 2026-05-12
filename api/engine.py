@@ -24,6 +24,7 @@ from indexer.retriever import (
     path_boost,
     rerank_results,
     rrf_fuse,
+    _STOPWORDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,7 @@ def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
                         "domain": payload.get("domain", cfg["domain"]),
                         "context": payload.get("context", ""),
                         "source_file": payload.get("source_file", ""),
+                        "chunk_index": payload.get("chunk_index", 0),
                         "has_code": payload.get("has_code", False),
                         "category": payload.get("category", ""),
                     },
@@ -169,7 +171,7 @@ def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
 
 
 def _result_key(r: dict) -> tuple:
-    return (r.get("source_file", ""), r.get("context", ""))
+    return (r.get("source_file", ""), r.get("chunk_index", r.get("context", "")))
 
 
 def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[str]:
@@ -187,6 +189,39 @@ def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[s
             terms.append(term)
             seen.add(term)
     return terms
+
+
+def _is_explanatory_query(query: str) -> bool:
+    q = query.lower()
+    markers = ("为什么", "为何", "原因", "原理", "背景", "体系", "架构", "不再支持", "不支持")
+    return any(m in q for m in markers)
+
+
+def _is_comparison_query(query: str) -> bool:
+    q = query.lower()
+    markers = ("区别", "差异", "对比", "比较", " vs ", " versus ")
+    return any(m in q for m in markers)
+
+
+def _drop_obvious_noise(results: List[dict], query: str = "", threshold: float = -3.0) -> List[dict]:
+    """Drop very-negative rerank results that are clearly off-topic.
+
+    Keeps results with rerank_score >= threshold, or whose source_file path
+    contains any non-stopword from the query (covers the "other side" of
+    comparison queries where the reranker underranks one concept).
+    """
+    import re as _re
+    q_terms = set(_re.findall(r'[\w]+', query.lower())) - _STOPWORDS if query else set()
+    def _path_hits(r: dict) -> bool:
+        src = r.get("source_file", "").lower()
+        return bool(q_terms and any(t in src for t in q_terms))
+    kept = [
+        r for r in results
+        if float(r.get("rerank_score", r.get("score", 0.0)) or 0.0) >= threshold
+        or int(r.get("field_match_terms", 0) or 0) > 0
+        or _path_hits(r)
+    ]
+    return kept or results[:1]
 
 
 def _field_match_rerank(results: List[dict], query: str, bm25: Any) -> List[dict]:
@@ -219,6 +254,94 @@ def _field_match_rerank(results: List[dict], query: str, bm25: Any) -> List[dict
 
     results.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
     return results
+
+
+def _chunk_lookup(chunks: list) -> tuple[dict[tuple, dict], dict[str, list[dict]]]:
+    by_key: dict[tuple, dict] = {}
+    by_source: dict[str, list[dict]] = {}
+    for pos, record in enumerate(chunks):
+        meta = record.get("metadata", {}) or {}
+        source = meta.get("source_file", "")
+        chunk_idx = meta.get("chunk_index", pos)
+        item = {"record": record, "pos": pos, "source_file": source, "chunk_index": chunk_idx}
+        by_key[(source, chunk_idx)] = item
+        by_source.setdefault(source, []).append(item)
+    for items in by_source.values():
+        items.sort(key=lambda x: (x.get("chunk_index", 0), x.get("pos", 0)))
+    return by_key, by_source
+
+
+def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int = 1, max_chars_per_result: int = 6000) -> List[dict]:
+    """Expand each hit with adjacent chunks from the same source document.
+
+    The API still returns topK results, but each result.text becomes a more useful
+    local document window for the LLM. This avoids forcing clients to read md files.
+    """
+    _, chunks = _load_bm25_for_domain(cfg)
+    if not chunks:
+        return results
+
+    by_key, by_source = _chunk_lookup(chunks)
+    expanded: list[dict] = []
+    for r in results:
+        source = r.get("source_file", "")
+        chunk_idx = r.get("chunk_index")
+        item = by_key.get((source, chunk_idx)) if chunk_idx is not None else None
+        if item is None:
+            # Fallback for legacy results without chunk_index.
+            for candidate in by_source.get(source, []):
+                meta = candidate["record"].get("metadata", {}) or {}
+                if meta.get("context", "") == r.get("context", ""):
+                    item = candidate
+                    break
+        if item is None:
+            expanded.append(r)
+            continue
+
+        source_items = by_source.get(source, [])
+        center_i = next((i for i, candidate in enumerate(source_items) if candidate is item), -1)
+        if center_i < 0:
+            expanded.append(r)
+            continue
+
+        selected = source_items[max(0, center_i - window): center_i + window + 1]
+        texts = []
+        contexts = []
+        total = 0
+        for selected_item in selected:
+            record = selected_item["record"]
+            text = record.get("text", "") or ""
+            meta = record.get("metadata", {}) or {}
+            if not text:
+                continue
+            if total + len(text) > max_chars_per_result and texts:
+                break
+            texts.append(text)
+            contexts.append(meta.get("context", ""))
+            total += len(text)
+
+        new_r = r.copy()
+        if texts:
+            new_r["text"] = "\n\n".join(texts)
+            new_r["expanded_chunks"] = len(texts)
+            new_r["expanded_contexts"] = contexts
+        expanded.append(new_r)
+
+    logger.info(
+        "RAG_CONTEXT_EXPAND domain=%s results=%d expanded=%s",
+        cfg.get("domain"),
+        len(expanded),
+        [
+            {
+                "source_file": r.get("source_file", ""),
+                "context": r.get("context", "")[:80],
+                "expanded_chunks": r.get("expanded_chunks", 1),
+                "text_len": len(r.get("text", "") or ""),
+            }
+            for r in expanded[:5]
+        ],
+    )
+    return expanded
 
 
 class DomainQueryEngine:
@@ -288,7 +411,8 @@ class DomainQueryEngine:
                 "context": meta.get("context", ""),
                 "source_file": meta.get("source_file", ""),
                 "has_code": meta.get("has_code", False),
-                "chunk_index": idx,
+                "chunk_index": meta.get("chunk_index", idx),
+                "chunk_pos": idx,
             })
         return results
 
@@ -334,6 +458,7 @@ class DomainQueryEngine:
                 "text": hit["payload"]["text"],
                 "context": hit["payload"].get("context", ""),
                 "source_file": hit["payload"].get("source_file", ""),
+                "chunk_index": hit["payload"].get("chunk_index", 0),
                 "has_code": hit["payload"].get("has_code", False),
             })
         return results
@@ -409,10 +534,26 @@ class DomainQueryEngine:
         self._log_stage("fusion", fused)
 
         if method in ("rerank", "hybrid_rerank"):
-            reranked = rerank_results(query, fused, top_k=top_k)
+            # Ask reranker for extra candidates, then filter noise + deduplicate.
+            # Comparison queries need balanced docs from both sides; skip field boost
+            # to avoid title-only API matches crowding out the paired concept guide.
+            is_comparison = _is_comparison_query(query)
+            reranked = rerank_results(query, fused, top_k=max(top_k * 3, 15))
             bm25, _ = _load_bm25_for_domain(self.cfg)
-            if bm25 is not None:
+            if bm25 is not None and not _is_explanatory_query(query) and not is_comparison:
                 reranked = _field_match_rerank(reranked, query, bm25)
+            # Always filter obvious noise regardless of query type.
+            reranked = _drop_obvious_noise(reranked, query)
+            # Deduplicate by source_file — keep only the best scoring chunk per file
+            # so the top-k covers more distinct documents.
+            seen_sources: set[str] = set()
+            deduped: list[dict] = []
+            for r in reranked:
+                src = r.get("source_file", "")
+                if src not in seen_sources:
+                    seen_sources.add(src)
+                    deduped.append(r)
+            reranked = deduped[:top_k]
             self._log_stage("rerank", reranked)
             return reranked
         return fused[:top_k]
@@ -443,6 +584,7 @@ class DomainQueryEngine:
         method: str = "hybrid",
     ) -> dict:
         results = self.search(question, top_k=top_k, category=category, has_code=has_code, method=method)
+        results = _expand_result_context(results, self.cfg)
         context = format_context(results)
         logger.info(
             "RAG_CONTEXT domain=%s method=%s result_count=%d context_chars=%d",

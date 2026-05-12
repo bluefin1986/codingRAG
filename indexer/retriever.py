@@ -216,7 +216,6 @@ def rrf_fuse(
         r["score"] = rrf_scores[key]
         r.pop("bm25_score", None)
         r.pop("semantic_score", None)
-        r.pop("chunk_index", None)
         results.append(r)
 
     return results
