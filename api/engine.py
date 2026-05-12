@@ -87,6 +87,9 @@ class DomainQueryEngine:
     # ── Embedding ──
 
     def embed_query(self, query: str) -> List[float]:
+        import re
+        # Normalize whitespace: collapse newlines/spaces, strip
+        query = re.sub(r'\s+', ' ', query).strip()
         client = httpx.Client(timeout=60.0)
         resp = client.post(
             f"{self.embedding_api_base}/api/v1/embeddings",

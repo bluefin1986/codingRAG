@@ -85,6 +85,33 @@ curl -s -X POST http://localhost:8060/api/v1/rag/query \
   | python3 -m json.tool
 ```
 
+## Docker 部署
+
+```bash
+# 构建镜像
+docker build -t codingrag-api .
+
+# 运行（需要 Qdrant 和 Embedding API 可达）
+docker run -d --name codingrag-api \
+  -p 8060:8060 \
+  -e CODING_RAG_PRELOAD_DOMAINS=ios,harmonyos \
+  -e CODING_RAG_QDRANT_HOST=host.docker.internal \
+  -e CODING_RAG_AIMODELS_API_BASE=http://host.docker.internal:8030 \
+  -v $(pwd)/output:/app/output:ro \
+  codingrag-api
+```
+
+## 启动预热
+
+通过 `CODING_RAG_PRELOAD_DOMAINS` 环境变量指定启动时需要预热的领域（逗号分隔）：
+
+```bash
+# 启动时加载 ios 和 harmonyos 的 BM25 索引，避免首次请求延迟
+CODING_RAG_PRELOAD_DOMAINS=ios,harmonyos python3 -m uvicorn api.app:app --host 0.0.0.0 --port 8060
+```
+
+预热在 FastAPI startup 事件中执行。如果某个领域加载失败，会记录警告但不阻止服务启动。
+
 ## 依赖服务
 
 | 服务 | 默认地址 | 用途 |

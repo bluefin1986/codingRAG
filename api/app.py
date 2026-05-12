@@ -15,6 +15,7 @@ Smoke test:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Dict
@@ -77,6 +78,36 @@ def _get_engine(domain: str) -> DomainQueryEngine:
     _engines[domain] = engine
     logger.info("Created engine for domain=%s (collection=%s)", domain, cfg["collection"])
     return engine
+
+
+def _preload_domains(domains_str: str) -> None:
+    """Pre-warm engines and BM25 indexes for specified domains at startup.
+
+    Accepts a comma-separated list of domain names from the
+    CODING_RAG_PRELOAD_DOMAINS environment variable, e.g.:
+        CODING_RAG_PRELOAD_DOMAINS=ios,harmonyos
+    """
+    domains = [d.strip().lower() for d in domains_str.split(',') if d.strip()]
+    if not domains:
+        return
+    logger.info("Preloading domains: %s", domains)
+    for domain in domains:
+        if domain not in DOMAIN_REGISTRY:
+            logger.warning("Skipping unknown domain for preload: %s", domain)
+            continue
+        try:
+            _get_engine(domain)
+            logger.info("Preloaded domain=%s", domain)
+        except Exception:
+            logger.exception("Failed to preload domain=%s", domain)
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    """Pre-warm configured domains if CODING_RAG_PRELOAD_DOMAINS is set."""
+    preload_env = os.getenv("CODING_RAG_PRELOAD_DOMAINS", "").strip()
+    if preload_env:
+        _preload_domains(preload_env)
 
 
 # ── Endpoints ──
