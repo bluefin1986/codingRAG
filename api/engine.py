@@ -51,10 +51,6 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
         return _BM25_CACHE[domain]
 
     chunks_path = cfg["output_dir"] / "chunks.jsonl"
-    if not chunks_path.exists():
-        logger.warning("chunks file not found for domain %s: %s", domain, chunks_path)
-        _BM25_CACHE[domain] = (None, [])
-        return None, []
 
     import jieba
     from rank_bm25 import BM25Okapi
@@ -62,11 +58,26 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
     t0 = time.time()
     chunks: list = []
     texts: list = []
-    with open(chunks_path, encoding="utf-8") as f:
-        for line in f:
-            record = json.loads(line)
-            chunks.append(record)
-            texts.append(_bm25_search_text(record))
+
+    if chunks_path.exists():
+        with open(chunks_path, encoding="utf-8") as f:
+            for line in f:
+                record = json.loads(line)
+                chunks.append(record)
+                texts.append(_bm25_search_text(record))
+    else:
+        logger.warning(
+            "chunks file not found for domain %s: %s; falling back to Qdrant payload scroll",
+            domain,
+            chunks_path,
+        )
+        chunks = _load_chunks_from_qdrant(cfg)
+        texts = [_bm25_search_text(record) for record in chunks]
+
+    if not chunks:
+        logger.warning("no chunks available for domain %s, BM25 disabled", domain)
+        _BM25_CACHE[domain] = (None, [])
+        return None, []
 
     tokenized = [list(jieba.cut(t)) for t in texts]
     bm25 = BM25Okapi(tokenized)
@@ -75,6 +86,54 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
 
     _BM25_CACHE[domain] = (bm25, chunks)
     return bm25, chunks
+
+
+def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
+    """Load BM25 source records from Qdrant payloads when local chunks.jsonl is absent."""
+    collection = cfg["collection"]
+    host = cfg.get("qdrant_host", "localhost")
+    port = cfg.get("qdrant_port", 6333)
+    url = f"http://{host}:{port}/collections/{collection}/points/scroll"
+    chunks: list = []
+    offset = None
+
+    with httpx.Client(timeout=60.0) as client:
+        while True:
+            body: Dict[str, Any] = {
+                "limit": 512,
+                "with_payload": True,
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+
+            resp = client.post(url, json=body)
+            resp.raise_for_status()
+            data = resp.json().get("result", {})
+            points = data.get("points", [])
+
+            for point in points:
+                payload = point.get("payload") or {}
+                text = payload.get("text") or ""
+                if not text:
+                    continue
+                chunks.append({
+                    "text": text,
+                    "metadata": {
+                        "domain": payload.get("domain", cfg["domain"]),
+                        "context": payload.get("context", ""),
+                        "source_file": payload.get("source_file", ""),
+                        "has_code": payload.get("has_code", False),
+                        "category": payload.get("category", ""),
+                    },
+                })
+
+            offset = data.get("next_page_offset")
+            if not offset:
+                break
+
+    logger.info("loaded %d chunks from Qdrant collection=%s for BM25", len(chunks), collection)
+    return chunks
 
 
 class DomainQueryEngine:
