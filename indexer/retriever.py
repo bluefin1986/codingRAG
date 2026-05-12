@@ -345,8 +345,29 @@ def format_context(results: List[dict]) -> str:
     for i, r in enumerate(results, 1):
         source = r["source_file"]
         context = r["context"]
-        parts.append(f"---\n[{i}] 来源: {source}\n分类: {context}\n\n{r['text']}")
+        text = _clean_chunk_text(r['text'])
+        parts.append(f"---\n[{i}] 来源: {source}\n分类: {context}\n\n{text}")
     return "\n\n".join(parts)
+
+
+def _clean_chunk_text(text: str) -> str:
+    """Remove navigation/frontmatter noise from the beginning of chunk text."""
+    import re
+    # Remove leading "文档: ..." line and following blank lines
+    text = re.sub(r'^文档:.*\n+', '', text)
+    # Remove YAML frontmatter blocks (--- ... ---)
+    text = re.sub(r'^---\n.*?---\n+', '', text, flags=re.DOTALL)
+    # Remove breadcrumb navigation: lines starting with "- " followed by blank line
+    # Matches sequences like:
+    #   - [UIKit](...)
+    #   - [Accessibility](...)
+    #   - UIAccessibility
+    text = re.sub(r'^(?:- (?:\[.*?\]\(.*?\)|[^\n]+)\n)+\n?', '', text)
+    # Remove "Framework" standalone line (common in Apple docs)
+    text = re.sub(r'^Framework\n+', '', text)
+    # Remove leading blank lines
+    text = text.lstrip('\n')
+    return text
 
 
 def rag_query(
