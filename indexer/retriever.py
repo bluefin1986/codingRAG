@@ -45,6 +45,17 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 
+def _bm25_search_text(record: dict) -> str:
+    """Build a compact BM25 document to avoid tokenizing huge chunks online."""
+    meta = record.get("metadata", {}) or {}
+    text = record.get("text", "") or ""
+    return " ".join([
+        str(meta.get("context", "")),
+        str(meta.get("source_file", "")),
+        text[:1200],
+    ])
+
+
 @lru_cache(maxsize=1)
 def _load_bm25_index():
     """加载 chunks 并构建 BM25 索引（懒加载，只执行一次）。"""
@@ -62,7 +73,7 @@ def _load_bm25_index():
         for line in tqdm(f, desc="BM25 loading chunks", unit="chunk"):
             record = json.loads(line)
             chunks.append(record)
-            texts.append(record["text"])
+            texts.append(_bm25_search_text(record))
 
     tokenized = [
         list(jieba.cut(t))
@@ -162,8 +173,9 @@ def rrf_fuse(
     bm25_results: List[dict],
     k: int = 30,
     semantic_weight: float = 1.0,
-    bm25_weight: float = 2.0,
+    bm25_weight: float = 0.1,
     top_k: int = 20,
+    bm25_only_boost: float = 1.0,
 ) -> List[dict]:
     """
     Reciproral Rank Fusion 融合语义 + BM25 两路结果。
@@ -191,9 +203,10 @@ def rrf_fuse(
         if key not in merged:
             merged[key] = r
 
-    # 仅 BM25 命中的结果额外 +20%（关键词精确匹配但语义漂移）
+    # Optional boost for BM25-only hits. Default is neutral because it can push
+    # exact-keyword but semantically weak API enum pages above better semantic hits.
     for key in bm25_keys - sem_keys:
-        rrf_scores[key] *= 1.2
+        rrf_scores[key] *= bm25_only_boost
 
     sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
 
@@ -230,6 +243,37 @@ def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) ->
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
+
+
+
+def identifier_boost(results: List[dict], query: str, boost_per_match: float = 1.0) -> List[dict]:
+    """Boost exact code/API identifiers from the query in title/path/text head."""
+    import re
+    stop = {"http", "https", "request", "error", "code", "arkts", "ios"}
+    raw_tokens = re.findall(r"[@A-Za-z_][A-Za-z0-9_@.:-]{2,}", query)
+    tokens = []
+    for t in raw_tokens:
+        token = t.strip(".,;:()[]{}<>`'\"").lower()
+        if token in stop:
+            continue
+        if len(token) >= 6 or "." in token or "@" in token or any(c.isupper() for c in t):
+            tokens.append(token)
+    if not tokens:
+        return results
+
+    for r in results:
+        haystack = " ".join([
+            r.get("context", ""),
+            r.get("source_file", ""),
+            (r.get("text", "") or "")[:2000],
+        ]).lower()
+        match_count = sum(1 for token in tokens if token in haystack)
+        if match_count:
+            r["score"] *= (1 + boost_per_match * match_count)
+            r["identifier_matches"] = match_count
+
+    results.sort(key=lambda r: r.get("score", 0), reverse=True)
+    return results
 
 # ── 混合检索（主入口）──
 
@@ -291,12 +335,14 @@ def _hybrid_search(query, top_k, category, has_code) -> List[dict]:
         bm25_results=bm25_results,
         k=30,
         semantic_weight=1.0,
-        bm25_weight=2.0,
+        bm25_weight=0.1,
         top_k=candidate_k,
+        bm25_only_boost=1.0,
     )
 
-    # 路径加权
-    fused = path_boost(fused, query)
+    # 路径/标识符加权
+    fused = path_boost(fused, query, boost_per_match=0.0)
+    fused = identifier_boost(fused, query, boost_per_match=1.0)
 
     return fused[:top_k]
 

@@ -32,6 +32,12 @@ DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
         "embedding_dim": 1024,
         "rerank_model_name": "bge-reranker-base",
         "prompt_role": "鸿蒙开发专家",
+        # HarmonyOS docs currently have ~90k chunks; loading a full in-memory BM25
+        # index is expensive and has caused the API worker to be killed. Keep
+        # semantic/rerank online first; re-enable BM25 after index optimization.
+        "bm25_enabled": True,
+        "bm25_weight": 0.7,
+        "path_boost_per_match": 0.0,
         "noise_patterns": [
             r"收起自动换行深色代码主题复制\s*",
             r"\[外链图片[^\]]*\]",
@@ -50,6 +56,9 @@ DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
         "embedding_dim": 1024,
         "rerank_model_name": "bge-reranker-base",
         "prompt_role": "iOS UIKit / Objective-C 开发专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.1,
+        "path_boost_per_match": 0.0,
         "noise_patterns": [
             r'title: "This page requires JavaScript\."\n',
             r"(?m)^- \[Documentation\]\([^\)]*\)\s*$",
@@ -82,6 +91,9 @@ def get_domain_config(domain: str | None = None) -> Dict[str, Any]:
     cfg["embedding_dim"] = int(os.getenv(prefix + "EMBEDDING_DIM", str(cfg["embedding_dim"])))
     cfg["rerank_model_name"] = os.getenv(prefix + "RERANK_MODEL_NAME", cfg["rerank_model_name"])
     cfg["prompt_role"] = os.getenv(prefix + "PROMPT_ROLE", cfg["prompt_role"])
+    cfg["bm25_enabled"] = os.getenv(prefix + "BM25_ENABLED", str(cfg.get("bm25_enabled", True))).lower() in ("1", "true", "yes", "on")
+    cfg["bm25_weight"] = float(os.getenv(prefix + "BM25_WEIGHT", str(cfg.get("bm25_weight", 0.7))))
+    cfg["path_boost_per_match"] = float(os.getenv(prefix + "PATH_BOOST_PER_MATCH", str(cfg.get("path_boost_per_match", 0.2))))
     cfg["noise_patterns"] = cfg.get("noise_patterns", [])
     cfg["output_dir"] = _path(os.getenv(prefix + "OUTPUT_DIR", os.getenv("CODING_RAG_OUTPUT_DIR", str(PROJECT_ROOT / "output" / name))))
     return cfg

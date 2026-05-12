@@ -20,6 +20,7 @@ from config import DOMAIN_REGISTRY, get_domain_config
 # Reuse pure helpers that don't depend on module-level config
 from indexer.retriever import (
     format_context,
+    identifier_boost,
     path_boost,
     rerank_results,
     rrf_fuse,
@@ -30,6 +31,17 @@ logger = logging.getLogger(__name__)
 # ── Per-domain BM25 index cache ──
 # Keyed by domain name; each entry is (bm25_instance, chunks_list) or None.
 _BM25_CACHE: Dict[str, tuple] = {}
+
+
+def _bm25_search_text(record: dict) -> str:
+    """Build a compact BM25 document to avoid tokenizing huge chunks online."""
+    meta = record.get("metadata", {}) or {}
+    text = record.get("text", "") or ""
+    return " ".join([
+        str(meta.get("context", "")),
+        str(meta.get("source_file", "")),
+        text[:1200],
+    ])
 
 
 def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
@@ -54,7 +66,7 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
         for line in f:
             record = json.loads(line)
             chunks.append(record)
-            texts.append(record["text"])
+            texts.append(_bm25_search_text(record))
 
     tokenized = [list(jieba.cut(t)) for t in texts]
     bm25 = BM25Okapi(tokenized)
@@ -83,6 +95,9 @@ class DomainQueryEngine:
         self.qdrant_host = cfg.get("qdrant_host", "localhost")
         self.qdrant_port = cfg.get("qdrant_port", 6333)
         self.prompt_role = cfg["prompt_role"]
+        self.bm25_enabled = bool(cfg.get("bm25_enabled", True))
+        self.bm25_weight = float(cfg.get("bm25_weight", 0.7))
+        self.path_boost_per_match = float(cfg.get("path_boost_per_match", 0.2))
 
     # ── Embedding ──
 
@@ -103,6 +118,10 @@ class DomainQueryEngine:
 
     def bm25_search(self, query: str, top_k: int = 20) -> List[dict]:
         import jieba
+
+        if not self.bm25_enabled:
+            logger.info("BM25 disabled for domain=%s", self.domain)
+            return []
 
         bm25, chunks = _load_bm25_for_domain(self.cfg)
         if bm25 is None:
@@ -185,36 +204,78 @@ class DomainQueryEngine:
         has_code: Optional[bool] = None,
         method: str = "hybrid",
     ) -> List[dict]:
+        logger.info(
+            "RAG_SEARCH_START domain=%s collection=%s method=%s top_k=%s category=%s has_code=%s query=%r",
+            self.domain,
+            self.collection,
+            method,
+            top_k,
+            category,
+            has_code,
+            query[:200],
+        )
+
         if method == "semantic":
             results = self.semantic_search(query, top_k=top_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("semantic_score")
+            self._log_stage("semantic", results)
             return results
 
         if method == "bm25":
             results = self.bm25_search(query, top_k=top_k)
             for r in results:
                 r["score"] = r.pop("bm25_score")
+            self._log_stage("bm25", results)
             return results
 
         # hybrid or rerank: run both, fuse, then optionally rerank
         candidate_k = max(top_k * 4, 20)
         sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
         bm25_results = self.bm25_search(query, top_k=candidate_k)
+        self._log_stage("semantic_candidates", sem_results)
+        self._log_stage("bm25_candidates", bm25_results)
 
-        fused = rrf_fuse(
-            semantic_results=sem_results,
-            bm25_results=bm25_results,
-            k=30,
-            semantic_weight=1.0,
-            bm25_weight=2.0,
-            top_k=candidate_k,
-        )
-        fused = path_boost(fused, query)
+        if not bm25_results:
+            fused = []
+            for r in sem_results[:candidate_k]:
+                item = r.copy()
+                item["score"] = item.pop("semantic_score", item.get("score", 0.0))
+                fused.append(item)
+        else:
+            fused = rrf_fuse(
+                semantic_results=sem_results,
+                bm25_results=bm25_results,
+                k=30,
+                semantic_weight=1.0,
+                bm25_weight=self.bm25_weight,
+                top_k=candidate_k,
+                bm25_only_boost=1.0,
+            )
+            fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
+            fused = identifier_boost(fused, query, boost_per_match=1.0)
+        self._log_stage("fusion", fused)
 
         if method in ("rerank", "hybrid_rerank"):
-            return rerank_results(query, fused, top_k=top_k)
+            reranked = rerank_results(query, fused, top_k=top_k)
+            self._log_stage("rerank", reranked)
+            return reranked
         return fused[:top_k]
+
+    # ── Diagnostics ──
+
+    def _log_stage(self, stage: str, results: List[dict], limit: int = 5) -> None:
+        """Log compact retrieval diagnostics without dumping full document text."""
+        summary = []
+        for i, r in enumerate(results[:limit], 1):
+            summary.append({
+                "rank": i,
+                "score": round(float(r.get("score", r.get("semantic_score", r.get("bm25_score", 0.0))) or 0.0), 4),
+                "context": r.get("context", "")[:120],
+                "source_file": r.get("source_file", ""),
+                "text_len": len(r.get("text", "") or ""),
+            })
+        logger.info("RAG_STAGE domain=%s stage=%s count=%d top=%s", self.domain, stage, len(results), summary)
 
     # ── Full RAG query ──
 
@@ -228,6 +289,13 @@ class DomainQueryEngine:
     ) -> dict:
         results = self.search(question, top_k=top_k, category=category, has_code=has_code, method=method)
         context = format_context(results)
+        logger.info(
+            "RAG_CONTEXT domain=%s method=%s result_count=%d context_chars=%d",
+            self.domain,
+            method,
+            len(results),
+            len(context),
+        )
 
         prompt = f"""你是{self.prompt_role}。基于以下参考文档回答用户问题。
 
