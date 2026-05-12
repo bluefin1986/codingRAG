@@ -224,7 +224,7 @@ def rrf_fuse(
 
 # ── 路径加权 ──
 
-_STOPWORDS = frozenset(('怎么', '如何', '什么', '创建', '使用', '实现', '的', '了', '和', '与', '或', '在', '是', '有', '一个', '几个', '用来', '还有'))
+_STOPWORDS = frozenset(('怎么', '如何', '什么', '创建', '使用', '实现', '开发', '应用', '鸿蒙', 'harmonyos', 'next', '的', '了', '和', '与', '或', '在', '是', '有', '一个', '几个', '用来', '还有'))
 
 
 def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) -> List[dict]:
@@ -232,10 +232,10 @@ def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) ->
     路径/标题加权：query 分词后，关键词在 source_file 或 context 中出现则加权。
     """
     query_tokens = list(jieba.cut(query))
-    query_keywords = [t for t in query_tokens if len(t) >= 2 and t not in _STOPWORDS]
+    query_keywords = [t.lower() for t in query_tokens if len(t) >= 2 and t not in _STOPWORDS]
 
     for r in results:
-        path_text = r.get("source_file", "") + " " + r.get("context", "")
+        path_text = (r.get("source_file", "") + " " + r.get("context", "")).lower()
         match_count = sum(1 for w in query_keywords if w in path_text)
         if match_count > 0:
             r["score"] *= (1 + boost_per_match * match_count)

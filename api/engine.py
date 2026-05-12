@@ -351,6 +351,10 @@ class DomainQueryEngine:
 
         if method in ("rerank", "hybrid_rerank"):
             reranked = rerank_results(query, fused, top_k=top_k)
+            # Prefer docs whose title/path exactly contains important query terms
+            # after rerank. This is generic and helps API lookup queries where the
+            # reranker may over-prefer broad examples containing the same term in body.
+            reranked = path_boost(reranked, query, boost_per_match=0.8)
             self._log_stage("rerank", reranked)
             return reranked
         return fused[:top_k]
