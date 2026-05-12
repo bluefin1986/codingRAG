@@ -72,6 +72,12 @@ def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
             chunks_path,
         )
         chunks = _load_chunks_from_qdrant(cfg)
+        if chunks:
+            chunks_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(chunks_path, "w", encoding="utf-8") as f:
+                for record in chunks:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info("persisted %d Qdrant payload chunks to %s", len(chunks), chunks_path)
         texts = [_bm25_search_text(record) for record in chunks]
 
     if not chunks:
@@ -100,7 +106,7 @@ def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
     with httpx.Client(timeout=60.0) as client:
         while True:
             body: Dict[str, Any] = {
-                "limit": 512,
+                "limit": 4096,
                 "with_payload": True,
                 "with_vector": False,
             }
