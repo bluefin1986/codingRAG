@@ -299,7 +299,7 @@ def search(
         return _bm25_only(query, top_k)
     elif method in ("rerank", "hybrid_rerank"):
         # Keep a wider first-stage pool so exact API docs are not dropped before rerank.
-        candidates = _hybrid_search(query, max(top_k * 10, 50), category, has_code)
+        candidates = _hybrid_search(query, max(top_k * 40, 200), category, has_code)
         return rerank_results(query, candidates, top_k=top_k)
     else:
         return _hybrid_search(query, top_k, category, has_code)

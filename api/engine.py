@@ -323,7 +323,7 @@ class DomainQueryEngine:
         # hybrid or rerank: run both, fuse, then optionally rerank.
         # Rerank needs a wider candidate pool; otherwise weak first-stage fusion can
         # drop exact API docs before the reranker sees them.
-        candidate_k = max(top_k * 10, 50) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
+        candidate_k = max(top_k * 40, 200) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
         sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
         bm25_results = self.bm25_search(query, top_k=candidate_k)
         self._log_stage("semantic_candidates", sem_results)
