@@ -224,7 +224,7 @@ def rrf_fuse(
 
 # ── 路径加权 ──
 
-_STOPWORDS = frozenset(('怎么', '如何', '什么', '创建', '使用', '实现', '开发', '应用', '鸿蒙', 'harmonyos', 'next', '的', '了', '和', '与', '或', '在', '是', '有', '一个', '几个', '用来', '还有'))
+_STOPWORDS = frozenset(('怎么', '如何', '什么', '为何', '为什么', '是否', '怎样', '的', '了', '和', '与', '或', '在', '是', '有', '一个', '几个', '用来', '还有'))
 
 
 def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) -> List[dict]:

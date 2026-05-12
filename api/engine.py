@@ -168,6 +168,59 @@ def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
     return chunks
 
 
+def _result_key(r: dict) -> tuple:
+    return (r.get("source_file", ""), r.get("context", ""))
+
+
+def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[str]:
+    """Return discriminative query terms according to the current collection IDF."""
+    import jieba
+    generic_stop = {"怎么", "如何", "什么", "为何", "为什么", "是否", "怎样", "的", "了", "和", "与", "或", "在", "是", "有", "中"}
+    terms: list[str] = []
+    seen = set()
+    for raw in jieba.cut(query):
+        term = raw.strip().lower()
+        if len(term) < 2 or term in generic_stop:
+            continue
+        idf = float(getattr(bm25, "idf", {}).get(raw, getattr(bm25, "idf", {}).get(term, 0.0)) or 0.0)
+        if idf >= min_idf and term not in seen:
+            terms.append(term)
+            seen.add(term)
+    return terms
+
+
+def _field_match_rerank(results: List[dict], query: str, bm25: Any) -> List[dict]:
+    """Promote results whose title/path matches discriminative query terms.
+
+    This is collection-driven via BM25 IDF, not a domain-specific stopword list.
+    It separates title/path API hits from broad body-only examples.
+    """
+    terms = _query_high_idf_terms(query, bm25)
+    if not terms:
+        return results
+
+    def field_score(r: dict) -> int:
+        field_text = f"{r.get('context', '')} {r.get('source_file', '')}".lower()
+        return sum(1 for t in terms if t in field_text)
+
+    for r in results:
+        r["field_match_terms"] = field_score(r)
+
+    if not any(r.get("field_match_terms", 0) for r in results):
+        return results
+
+    for r in results:
+        base = float(r.get("rerank_score", r.get("score", 0.0)) or 0.0)
+        field = int(r.get("field_match_terms", 0) or 0)
+        bm25_rank = r.get("bm25_rank")
+        bm25_rank_bonus = (20.0 / float(bm25_rank)) if field and bm25_rank else 0.0
+        # Keep score monotonic for logs/response while preserving rerank_score separately.
+        r["score"] = base + field * 2.0 + bm25_rank_bonus
+
+    results.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    return results
+
+
 class DomainQueryEngine:
     """RAG query engine that operates on a specific domain config.
 
@@ -326,6 +379,10 @@ class DomainQueryEngine:
         candidate_k = max(top_k * 40, 200) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
         sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
         bm25_results = self.bm25_search(query, top_k=candidate_k)
+        bm25_meta = {
+            _result_key(r): {"bm25_rank": rank, "bm25_score": r.get("bm25_score", 0.0)}
+            for rank, r in enumerate(bm25_results, 1)
+        }
         self._log_stage("semantic_candidates", sem_results)
         self._log_stage("bm25_candidates", bm25_results)
 
@@ -347,14 +404,15 @@ class DomainQueryEngine:
             )
             fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
             fused = identifier_boost(fused, query, boost_per_match=1.0)
+        for item in fused:
+            item.update(bm25_meta.get(_result_key(item), {}))
         self._log_stage("fusion", fused)
 
         if method in ("rerank", "hybrid_rerank"):
             reranked = rerank_results(query, fused, top_k=top_k)
-            # Prefer docs whose title/path exactly contains important query terms
-            # after rerank. This is generic and helps API lookup queries where the
-            # reranker may over-prefer broad examples containing the same term in body.
-            reranked = path_boost(reranked, query, boost_per_match=0.8)
+            bm25, _ = _load_bm25_for_domain(self.cfg)
+            if bm25 is not None:
+                reranked = _field_match_rerank(reranked, query, bm25)
             self._log_stage("rerank", reranked)
             return reranked
         return fused[:top_k]
