@@ -372,13 +372,50 @@ class DomainQueryEngine:
         import re
         # Normalize whitespace: collapse newlines/spaces, strip
         query = re.sub(r'\s+', ' ', query).strip()
-        client = httpx.Client(timeout=60.0)
-        resp = client.post(
-            f"{self.embedding_api_base}/api/v1/embeddings",
-            json={"input": [query], "model": self.embedding_model_name},
+        endpoint = f"{self.embedding_api_base}/api/v1/embeddings"
+        payload = {"input": [query], "model": self.embedding_model_name}
+
+        logger.info(
+            "EMBED_QUERY_REQUEST endpoint=%s domain=%s collection=%s model=%s query=%r",
+            endpoint,
+            self.domain,
+            self.collection,
+            self.embedding_model_name,
+            query,
         )
-        resp.raise_for_status()
-        client.close()
+
+        with httpx.Client(timeout=60.0) as client:
+            try:
+                resp = client.post(endpoint, json=payload)
+                logger.info(
+                    "EMBED_QUERY_RESPONSE endpoint=%s status=%s model=%s body_preview=%s",
+                    endpoint,
+                    resp.status_code,
+                    self.embedding_model_name,
+                    resp.text[:500],
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                logger.error(
+                    "EMBED_QUERY_HTTP_ERROR endpoint=%s status=%s model=%s domain=%s body_preview=%s",
+                    endpoint,
+                    response.status_code,
+                    self.embedding_model_name,
+                    self.domain,
+                    response.text[:1000],
+                )
+                raise
+            except httpx.RequestError as exc:
+                logger.error(
+                    "EMBED_QUERY_REQUEST_ERROR endpoint=%s model=%s domain=%s error=%s",
+                    endpoint,
+                    self.embedding_model_name,
+                    self.domain,
+                    exc,
+                )
+                raise
+
         return resp.json()["data"][0]["embedding"]
 
     # ── BM25 ──
