@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from functools import lru_cache
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from tqdm import tqdm
@@ -21,6 +22,9 @@ from config import (
     RERANK_API_BASE,
     RERANK_MODEL_NAME,
 )
+
+from indexer.es_searcher import ESSearcher
+from indexer.local_bm25_searcher import LocalBM25Searcher
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +43,11 @@ def embed_query(query: str) -> List[float]:
     return resp.json()["data"][0]["embedding"]
 
 
-# ── BM25 本地检索（jieba 分词）──
-
-import jieba
-from rank_bm25 import BM25Okapi
+# ── Keyword search backend ──
 
 
-def _bm25_search_text(record: dict) -> str:
-    """Build a compact BM25 document to avoid tokenizing huge chunks online."""
+def _keyword_search_text(record: dict) -> str:
+    """Build a compact keyword-search document to avoid tokenizing huge chunks online."""
     meta = record.get("metadata", {}) or {}
     text = record.get("text", "") or ""
     return " ".join([
@@ -57,61 +58,89 @@ def _bm25_search_text(record: dict) -> str:
 
 
 @lru_cache(maxsize=1)
-def _load_bm25_index():
-    """加载 chunks 并构建 BM25 索引（懒加载，只执行一次）。"""
-    import time
-    t0 = time.time()
+def _load_keyword_searcher():
+    """Load keyword search backend for legacy retriever.py entry points."""
+    backend = os.getenv("CODING_RAG_KEYWORD_BACKEND", "local_bm25").strip().lower()
+
+    if backend in ("elasticsearch", "opensearch", "es"):
+        base_url = os.getenv("CODING_RAG_ES_URL", "").strip()
+        if base_url:
+            index_name = os.getenv(
+                f"CODING_RAG_ES_INDEX_{ACTIVE_DOMAIN.upper()}",
+                f"codingrag_{ACTIVE_DOMAIN}_docs",
+            )
+            searcher = ESSearcher(
+                domain=ACTIVE_DOMAIN,
+                index_name=index_name,
+                base_url=base_url,
+                api_key=os.getenv("CODING_RAG_ES_API_KEY"),
+                config={"domain": ACTIVE_DOMAIN},
+            )
+            logger.info(
+                "keyword searcher loaded for legacy retriever backend=%s index=%s url=%s",
+                backend,
+                index_name,
+                base_url,
+            )
+            return searcher, []
+
+        logger.warning(
+            "keyword backend=%s selected but CODING_RAG_ES_URL is empty; falling back to local BM25",
+            backend,
+        )
 
     chunks_path = CHUNKS_FILE
     if not chunks_path.exists():
-        logger.warning("chunks file not found: %s, BM25 disabled", chunks_path)
+        logger.warning("chunks file not found: %s, keyword search disabled", chunks_path)
         return None, []
 
-    chunks = []
-    texts = []
+    chunks: List[Dict[str, Any]] = []
     with open(chunks_path, encoding="utf-8") as f:
-        for line in tqdm(f, desc="BM25 loading chunks", unit="chunk"):
+        for line in tqdm(f, desc="Keyword loading chunks", unit="chunk"):
+            line = line.strip()
+            if not line:
+                continue
             record = json.loads(line)
-            chunks.append(record)
-            texts.append(_bm25_search_text(record))
+            compact_record = dict(record)
+            compact_record["original_text"] = record.get("text", "") or ""
+            compact_record["text"] = _keyword_search_text(record)
+            chunks.append(compact_record)
 
-    tokenized = [
-        list(jieba.cut(t))
-        for t in tqdm(texts, desc="BM25 tokenizing", unit="chunk")
-    ]
-    logger.info("building BM25 index from %d tokenized chunks ...", len(tokenized))
-    bm25 = BM25Okapi(tokenized)
+    if not chunks:
+        logger.warning("no chunks found in %s, keyword search disabled", chunks_path)
+        return None, []
 
-    elapsed = time.time() - t0
-    logger.info("BM25 index loaded: %d chunks in %.1fs", len(chunks), elapsed)
-    return bm25, chunks
+    searcher = LocalBM25Searcher(domain=ACTIVE_DOMAIN, chunks=chunks, config={"domain": ACTIVE_DOMAIN})
+    logger.info("keyword searcher loaded for legacy retriever backend=local_bm25 chunks=%d", len(chunks))
+    return searcher, chunks
 
 
 def bm25_search(query: str, top_k: int = 20) -> List[dict]:
-    """BM25 关键词检索。"""
-    bm25, chunks = _load_bm25_index()
-    if bm25 is None:
+    """BM25 keyword retrieval through the configured keyword backend."""
+    searcher, chunks = _load_keyword_searcher()
+    if searcher is None:
         return []
 
-    query_tokens = list(jieba.cut(query))
-    scores = bm25.get_scores(query_tokens)
-
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-
+    keyword_results = searcher.search(query, top_k=top_k)
     results = []
-    for idx in top_indices:
-        if scores[idx] <= 0:
-            break
-        record = chunks[idx]
-        meta = record.get("metadata", {})
+    for item in keyword_results:
+        meta = item.metadata or {}
+        chunk_pos = meta.get("chunk_pos")
+        text = item.text
+        if chunks and chunk_pos is not None:
+            try:
+                text = chunks[int(chunk_pos)].get("original_text") or item.text
+            except (IndexError, TypeError, ValueError):
+                text = item.text
+
         results.append({
-            "bm25_score": float(scores[idx]),
+            "bm25_score": float(item.score),
             "domain": meta.get("domain", ACTIVE_DOMAIN),
-            "text": record["text"],
+            "text": text,
             "context": meta.get("context", ""),
             "source_file": meta.get("source_file", ""),
             "has_code": meta.get("has_code", False),
-            "chunk_index": idx,
+            "chunk_index": meta.get("chunk_index", chunk_pos if chunk_pos is not None else 0),
         })
 
     return results
@@ -230,6 +259,8 @@ def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) ->
     """
     路径/标题加权：query 分词后，关键词在 source_file 或 context 中出现则加权。
     """
+    import jieba
+
     query_tokens = list(jieba.cut(query))
     query_keywords = [t.lower() for t in query_tokens if len(t) >= 2 and t not in _STOPWORDS]
 

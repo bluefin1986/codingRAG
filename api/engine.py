@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -27,12 +26,14 @@ from indexer.retriever import (
     rrf_fuse,
     _STOPWORDS,
 )
+from indexer.local_bm25_searcher import LocalBM25Searcher
+from indexer.es_searcher import ESSearcher
 
 logger = logging.getLogger(__name__)
 
-# ── Per-domain BM25 index cache ──
-# Keyed by domain name; each entry is (bm25_instance, chunks_list) or None.
-_BM25_CACHE: Dict[str, tuple] = {}
+# ── Per-domain keyword searcher cache ──
+# Keyed by domain name; each entry is (keyword_searcher, chunks_list) or (None, []).
+_KEYWORD_SEARCHER_CACHE: Dict[str, tuple] = {}
 
 
 def _qdrant_headers() -> Dict[str, str]:
@@ -41,91 +42,97 @@ def _qdrant_headers() -> Dict[str, str]:
     return {"api-key": api_key} if api_key else {}
 
 
-def _bm25_search_text(record: dict) -> str:
-    """Build a compact BM25 document to avoid tokenizing huge chunks online."""
-    meta = record.get("metadata", {}) or {}
-    text = record.get("text", "") or ""
-    return " ".join([
-        str(meta.get("context", "")),
-        str(meta.get("source_file", "")),
-        text[:1200],
-    ])
-
-
-def _load_bm25_for_domain(cfg: Dict[str, Any]) -> tuple:
-    """Load and cache BM25 index for a specific domain."""
+def _load_keyword_searcher_for_domain(cfg: Dict[str, Any]) -> tuple:
+    """Load and cache keyword searcher for a specific domain."""
     domain = cfg["domain"]
-    if domain in _BM25_CACHE:
-        return _BM25_CACHE[domain]
+    backend = os.getenv("CODING_RAG_KEYWORD_BACKEND", cfg.get("keyword_backend", "local_bm25")).strip().lower()
+    cache_key = f"{domain}:{backend}"
 
-    chunks_path = cfg["output_dir"] / "chunks.jsonl"
+    if cache_key in _KEYWORD_SEARCHER_CACHE:
+        return _KEYWORD_SEARCHER_CACHE[cache_key]
 
-    import jieba
-    from rank_bm25 import BM25Okapi
+    if backend in ("elasticsearch", "opensearch", "es"):
+        base_url = os.getenv("CODING_RAG_ES_URL", cfg.get("es_url", "")).strip()
+        if not base_url:
+            logger.warning(
+                "keyword backend=%s selected for domain=%s but CODING_RAG_ES_URL is empty; falling back to local BM25",
+                backend,
+                domain,
+            )
+        else:
+            index_name = os.getenv(
+                f"CODING_RAG_ES_INDEX_{domain.upper()}",
+                cfg.get("es_index") or f"codingrag_{domain}_docs",
+            )
+            searcher = ESSearcher(
+                domain=domain,
+                index_name=index_name,
+                base_url=base_url,
+                api_key=os.getenv("CODING_RAG_ES_API_KEY"),
+                config=cfg,
+            )
+            logger.info(
+                "keyword searcher loaded for domain %s backend=%s index=%s url=%s",
+                domain,
+                backend,
+                index_name,
+                base_url,
+            )
+            _KEYWORD_SEARCHER_CACHE[cache_key] = (searcher, [])
+            return searcher, []
 
-    t0 = time.time()
-    chunks: list = []
-    texts: list = []
-
-    if chunks_path.exists():
-        with open(chunks_path, encoding="utf-8") as f:
-            for line in f:
-                record = json.loads(line)
-                chunks.append(record)
-                texts.append(_bm25_search_text(record))
-    else:
-        logger.warning(
-            "chunks file not found for domain %s: %s; falling back to Qdrant payload scroll",
-            domain,
-            chunks_path,
-        )
-        chunks = _load_chunks_from_qdrant(cfg)
-        if chunks:
-            chunks_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(chunks_path, "w", encoding="utf-8") as f:
-                for record in chunks:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            logger.info("persisted %d Qdrant payload chunks to %s", len(chunks), chunks_path)
-        texts = [_bm25_search_text(record) for record in chunks]
-
+    chunks = _load_chunks_for_keyword_search(cfg)
     if not chunks:
-        logger.warning("no chunks available for domain %s, BM25 disabled", domain)
-        _BM25_CACHE[domain] = (None, [])
+        logger.warning("no chunks available for domain %s, keyword search disabled", domain)
+        _KEYWORD_SEARCHER_CACHE[cache_key] = (None, [])
         return None, []
 
-    logger.info("BM25 tokenizing start for domain %s: %d chunks", domain, len(texts))
-    t_tokenize = time.time()
-    tokenized = []
-    for i, text in enumerate(texts, 1):
-        tokenized.append(list(jieba.cut(text)))
-        if i % 10000 == 0 or i == len(texts):
-            logger.info(
-                "BM25 tokenizing progress domain=%s chunks=%d/%d elapsed=%.1fs",
-                domain,
-                i,
-                len(texts),
-                time.time() - t_tokenize,
-            )
+    searcher = LocalBM25Searcher(domain=domain, chunks=chunks, config=cfg)
+    logger.info("keyword searcher loaded for domain %s backend=local_bm25 chunks=%d", domain, len(chunks))
 
-    logger.info(
-        "BM25 building index start for domain %s: %d tokenized chunks tokenized_elapsed=%.1fs",
-        domain,
-        len(tokenized),
-        time.time() - t_tokenize,
-    )
-    t_build = time.time()
-    bm25 = BM25Okapi(tokenized)
-    elapsed = time.time() - t0
-    logger.info(
-        "BM25 index loaded for domain %s: %d chunks in %.1fs build_elapsed=%.1fs",
-        domain,
-        len(chunks),
-        elapsed,
-        time.time() - t_build,
-    )
+    _KEYWORD_SEARCHER_CACHE[cache_key] = (searcher, chunks)
+    return searcher, chunks
 
-    _BM25_CACHE[domain] = (bm25, chunks)
-    return bm25, chunks
+
+def _load_chunks_for_keyword_search(cfg: Dict[str, Any]) -> list:
+    """Load source records used by keyword search."""
+    chunks_path = cfg["output_dir"] / "chunks.jsonl"
+    domain = cfg["domain"]
+
+    if chunks_path.exists():
+        chunks: list = []
+        with open(chunks_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                meta = record.get("metadata", {}) or {}
+                text = record.get("text", "") or ""
+                keyword_text = " ".join([
+                    str(meta.get("context", "")),
+                    str(meta.get("source_file", "")),
+                    text[:1200],
+                ])
+                compact_record = dict(record)
+                compact_record["text"] = keyword_text
+                compact_record["original_text"] = text
+                chunks.append(compact_record)
+        return chunks
+
+    logger.warning(
+        "chunks file not found for domain %s: %s; falling back to Qdrant payload scroll",
+        domain,
+        chunks_path,
+    )
+    chunks = _load_chunks_from_qdrant(cfg)
+    if chunks:
+        chunks_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            for record in chunks:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info("persisted %d Qdrant payload chunks to %s", len(chunks), chunks_path)
+    return chunks
 
 
 def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
@@ -284,7 +291,7 @@ def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int
     The API still returns topK results, but each result.text becomes a more useful
     local document window for the LLM. This avoids forcing clients to read md files.
     """
-    _, chunks = _load_bm25_for_domain(cfg)
+    _, chunks = _load_keyword_searcher_for_domain(cfg)
     if not chunks:
         return results
 
@@ -428,35 +435,34 @@ class DomainQueryEngine:
     # ── BM25 ──
 
     def bm25_search(self, query: str, top_k: int = 20) -> List[dict]:
-        import jieba
-
         if not self.bm25_enabled:
             logger.info("BM25 disabled for domain=%s", self.domain)
             return []
 
-        bm25, chunks = _load_bm25_for_domain(self.cfg)
-        if bm25 is None:
+        searcher, chunks = _load_keyword_searcher_for_domain(self.cfg)
+        if searcher is None:
             return []
 
-        query_tokens = list(jieba.cut(query))
-        scores = bm25.get_scores(query_tokens)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-
+        keyword_results = searcher.search(query, top_k=top_k)
         results = []
-        for idx in top_indices:
-            if scores[idx] <= 0:
-                break
-            record = chunks[idx]
-            meta = record.get("metadata", {})
+        for result in keyword_results:
+            meta = result.metadata or {}
+            chunk_pos = meta.get("chunk_pos")
+            original_text = result.text
+            if chunks and chunk_pos is not None:
+                try:
+                    original_text = chunks[int(chunk_pos)].get("original_text") or result.text
+                except (IndexError, TypeError, ValueError):
+                    original_text = result.text
             results.append({
-                "bm25_score": float(scores[idx]),
+                "bm25_score": float(result.score),
                 "domain": meta.get("domain", self.domain),
-                "text": record["text"],
+                "text": original_text,
                 "context": meta.get("context", ""),
                 "source_file": meta.get("source_file", ""),
                 "has_code": meta.get("has_code", False),
-                "chunk_index": meta.get("chunk_index", idx),
-                "chunk_pos": idx,
+                "chunk_index": meta.get("chunk_index", chunk_pos if chunk_pos is not None else 0),
+                "chunk_pos": chunk_pos,
             })
         return results
 
@@ -584,7 +590,8 @@ class DomainQueryEngine:
             # to avoid title-only API matches crowding out the paired concept guide.
             is_comparison = _is_comparison_query(query)
             reranked = rerank_results(query, fused, top_k=max(top_k * 3, 15))
-            bm25, _ = _load_bm25_for_domain(self.cfg)
+            keyword_searcher, _ = _load_keyword_searcher_for_domain(self.cfg)
+            bm25 = getattr(keyword_searcher, "_bm25", None) if keyword_searcher is not None else None
             if bm25 is not None and not _is_explanatory_query(query) and not is_comparison:
                 reranked = _field_match_rerank(reranked, query, bm25)
             # Always filter obvious noise regardless of query type.
