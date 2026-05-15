@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,12 @@ logger = logging.getLogger(__name__)
 # ── Per-domain BM25 index cache ──
 # Keyed by domain name; each entry is (bm25_instance, chunks_list) or None.
 _BM25_CACHE: Dict[str, tuple] = {}
+
+
+def _qdrant_headers() -> Dict[str, str]:
+    """Build Qdrant request headers, including API key when configured."""
+    api_key = os.getenv("CODING_RAG_QDRANT_API_KEY")
+    return {"api-key": api_key} if api_key else {}
 
 
 def _bm25_search_text(record: dict) -> str:
@@ -140,7 +147,7 @@ def _load_chunks_from_qdrant(cfg: Dict[str, Any]) -> list:
             if offset is not None:
                 body["offset"] = offset
 
-            resp = client.post(url, json=body)
+            resp = client.post(url, json=body, headers=_qdrant_headers())
             resp.raise_for_status()
             data = resp.json().get("result", {})
             points = data.get("points", [])
@@ -483,6 +490,7 @@ class DomainQueryEngine:
         resp = client.post(
             f"http://{self.qdrant_host}:{self.qdrant_port}/collections/{self.collection}/points/search",
             json=search_body,
+            headers=_qdrant_headers(),
         )
         resp.raise_for_status()
         client.close()
