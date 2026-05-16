@@ -162,4 +162,13 @@ def rag_query(req: RagQueryRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api.app:app", host="0.0.0.0", port=8060, reload=False)
+    host = os.getenv("CODINGRAG_HTTP_HOST", "0.0.0.0")
+    port = int(os.getenv("CODINGRAG_HTTP_PORT", "8060"))
+    reload_enabled = os.getenv("CODINGRAG_HTTP_RELOAD", "false").lower() == "true"
+
+    uvicorn.run(
+        "api.app:app",
+        host=host,
+        port=port,
+        reload=reload_enabled,
+    )

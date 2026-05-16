@@ -1,31 +1,31 @@
 services:
-  app:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        HTTP_PROXY: ${HTTP_PROXY:-}
-        HTTPS_PROXY: ${HTTPS_PROXY:-}
-        NO_PROXY: ${NO_PROXY:-}
-    image: ${CODINGRAG_IMAGE:-codingrag:latest}
-    container_name: ${CODINGRAG_CONTAINER_NAME:-codingrag-app}
-    ports:
-      - "${CODINGRAG_HTTP_PORT:-8060}:8060"
-    environment:
-      CODING_RAG_PRELOAD_DOMAINS: ${CODING_RAG_PRELOAD_DOMAINS:-}
-      CODING_RAG_AIMODELS_API_BASE: ${CODING_RAG_AIMODELS_API_BASE:-http://10.63.3.80:8030}
-      CODING_RAG_QDRANT_HOST: qdrant
-      CODING_RAG_QDRANT_PORT: "6333"
-      CODING_RAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-codingrag-qdrant-secret}
-      CODING_RAG_KEYWORD_BACKEND: ${CODING_RAG_KEYWORD_BACKEND:-local_bm25}
-      CODING_RAG_ES_URL: ${CODING_RAG_ES_URL:-http://opensearch:9200}
-      CODING_RAG_ES_API_KEY: ${CODING_RAG_ES_API_KEY:-}
-      CODING_RAG_ES_INDEX_HARMONYOS: ${CODING_RAG_ES_INDEX_HARMONYOS:-codingrag_harmonyos_docs}
-    depends_on:
-      - qdrant
-      - opensearch
-    restart: unless-stopped
+  # app:
+  #   platform: linux/amd64
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     args:
+  #       HTTP_PROXY: ${HTTP_PROXY:-}
+  #       HTTPS_PROXY: ${HTTPS_PROXY:-}
+  #       NO_PROXY: ${NO_PROXY:-}
+  #   image: ${CODINGRAG_IMAGE:-codingrag:latest}
+  #   container_name: ${CODINGRAG_CONTAINER_NAME:-codingrag-app}
+  #   ports:
+  #     - "${CODINGRAG_HTTP_PORT:-8060}:8060"
+  #   environment:
+  #     CODING_RAG_PRELOAD_DOMAINS: ${CODING_RAG_PRELOAD_DOMAINS:-}
+  #     CODING_RAG_AIMODELS_API_BASE: ${CODING_RAG_AIMODELS_API_BASE:-http://10.63.3.80:8030}
+  #     CODING_RAG_QDRANT_HOST: qdrant
+  #     CODING_RAG_QDRANT_PORT: "6333"
+  #     CODING_RAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-codingrag-qdrant-secret}
+  #     CODING_RAG_KEYWORD_BACKEND: ${CODING_RAG_KEYWORD_BACKEND:-local_bm25}
+  #     CODING_RAG_ES_URL: ${CODING_RAG_ES_URL:-http://opensearch:9200}
+  #     CODING_RAG_ES_API_KEY: ${CODING_RAG_ES_API_KEY:-}
+  #     CODING_RAG_ES_INDEX_HARMONYOS: ${CODING_RAG_ES_INDEX_HARMONYOS:-codingrag_harmonyos_docs}
+  #   depends_on:
+  #     - qdrant
+  #     - opensearch
+  #   restart: unless-stopped
 
   qdrant:
     platform: linux/amd64
