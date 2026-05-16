@@ -15,7 +15,7 @@
                 "--reload"
             ],
             "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env",
+            "envFile": "${workspaceFolder}/.env.debug",
             "console": "integratedTerminal",
             "justMyCode": true
         },
@@ -25,7 +25,7 @@
             "request": "launch",
             "program": "${file}",
             "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env",
+            "envFile": "${workspaceFolder}/.env.debug",
             "console": "integratedTerminal"
         }
     ]
