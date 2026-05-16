@@ -42,7 +42,13 @@ class KeywordSearcher(ABC):
         self.config = config or {}
 
     @abstractmethod
-    def search(self, query: str, top_k: int = 20) -> List[KeywordSearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        category: Optional[str] = None,
+        has_code: Optional[bool] = None,
+    ) -> List[KeywordSearchResult]:
         """Search keyword index and return normalized results."""
         raise NotImplementedError
 

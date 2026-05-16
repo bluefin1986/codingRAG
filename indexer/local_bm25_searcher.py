@@ -44,7 +44,13 @@ class LocalBM25Searcher(KeywordSearcher):
         ]
         self._bm25 = BM25Okapi(self._tokenized_corpus)
 
-    def search(self, query: str, top_k: int = 20) -> List[KeywordSearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        category: Optional[str] = None,
+        has_code: Optional[bool] = None,
+    ) -> List[KeywordSearchResult]:
         """Search local BM25 index and return normalized keyword results."""
         if not query or not self._bm25 or not self.chunks:
             return []
@@ -65,6 +71,10 @@ class LocalBM25Searcher(KeywordSearcher):
 
             chunk = self.chunks[index]
             metadata = dict(chunk.get("metadata") or {})
+            if category and metadata.get("category") != category:
+                continue
+            if has_code is not None and bool(metadata.get("has_code", False)) != has_code:
+                continue
             metadata["chunk_pos"] = index
             results.append(
                 KeywordSearchResult(

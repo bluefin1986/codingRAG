@@ -41,29 +41,55 @@ class ESSearcher(KeywordSearcher):
             headers["Authorization"] = f"ApiKey {self.api_key}"
         return headers
 
-    def _build_query(self, query: str, top_k: int) -> Dict[str, Any]:
+    def _build_query(
+        self,
+        query: str,
+        top_k: int,
+        category: Optional[str] = None,
+        has_code: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         """Build Elasticsearch/OpenSearch BM25 query."""
+        filters: List[Dict[str, Any]] = [{"term": {"domain": self.domain}}]
+        if category:
+            filters.append({"term": {"category": category}})
+        if has_code is not None:
+            filters.append({"term": {"has_code": has_code}})
+
         return {
             "size": top_k,
             "query": {
-                "multi_match": {
-                    "query": query,
-                    "fields": [
-                        "text^1",
-                        "context^2",
-                        "source_file^3",
+                "bool": {
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": [
+                                    "context^4",
+                                    "source_file.text^3",
+                                    "identifier_text^3",
+                                    "text^1",
+                                ],
+                                "type": "best_fields",
+                            }
+                        }
                     ],
-                    "type": "best_fields",
+                    "filter": filters,
                 }
             },
         }
 
-    def search(self, query: str, top_k: int = 20) -> List[KeywordSearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        category: Optional[str] = None,
+        has_code: Optional[bool] = None,
+    ) -> List[KeywordSearchResult]:
         """Execute BM25 search against Elasticsearch/OpenSearch."""
         if not query:
             return []
 
-        payload = self._build_query(query, top_k)
+        payload = self._build_query(query, top_k, category=category, has_code=has_code)
 
         response = self.client.post(
             f"{self.base_url}/{self.index_name}/_search",
