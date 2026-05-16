@@ -15,22 +15,7 @@ CODINGRAG_HTTP_PORT="${CODINGRAG_HTTP_PORT:-8060}"
 
 BASE_URL="${BASE_URL:-http://${CODINGRAG_HTTP_HOST}:${CODINGRAG_HTTP_PORT}}"
 QDRANT_API_KEY="${QDRANT_API_KEY:-QDRANT_API_KEY}"
-COLLECTION="${COLLECTION:-ios_docs}"
-DOMAIN="${DOMAIN:-ios}"
-
-case "$DOMAIN" in
-  ios)
-    DEFAULT_QUERY="Objective-C UIButton 怎么响应点击事件"
-    ;;
-  harmonyos)
-    DEFAULT_QUERY="HarmonyOS ArkUI Button 如何绑定点击事件"
-    ;;
-  *)
-    DEFAULT_QUERY="Objective-C UIButton 怎么响应点击事件"
-    ;;
-esac
-
-QUERY="${QUERY:-$DEFAULT_QUERY}"
+DOMAINS=(ios harmonyos)
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -170,8 +155,10 @@ if not isinstance(context, str) or not context.strip():
 first = results[0]
 source = first.get("source_file", "") if isinstance(first, dict) else ""
 score = first.get("score", "") if isinstance(first, dict) else ""
-
-print(f"PASS|results={len(results)},source={source},score={score}")
+text = first.get("text", "") if isinstance(first, dict) else ""
+text = text.replace("\n", " ").strip()
+preview = text[:300]
+print(f"PASS|results={len(results)},source={source},score={score},preview={preview}")
 ' "$tmp")
 
   local status detail
@@ -212,9 +199,7 @@ print_summary() {
 print_title "codingRAG API regression test"
 
 echo "BASE_URL=$BASE_URL"
-echo "COLLECTION=$COLLECTION"
-echo "DOMAIN=$DOMAIN"
-echo "QUERY=$QUERY"
+echo "DOMAINS=${DOMAINS[*]}"
 
 # ------------------------------------------------------------------
 # 基础检查
@@ -227,7 +212,28 @@ run_check "docs" "$BASE_URL/docs"
 # rag query
 # ------------------------------------------------------------------
 
-RAG_PAYLOAD=$(cat <<EOF
+for DOMAIN in "${DOMAINS[@]}"; do
+  case "$DOMAIN" in
+    ios)
+      COLLECTION="ios_docs"
+      QUERY="Objective-C UIButton 怎么响应点击事件"
+      ;;
+    harmonyos)
+      COLLECTION="harmonyos_docs"
+      QUERY="HarmonyOS ArkUI Button 如何绑定点击事件"
+      ;;
+    *)
+      COLLECTION="ios_docs"
+      QUERY="Objective-C UIButton 怎么响应点击事件"
+      ;;
+  esac
+
+  echo
+  echo "DOMAIN=$DOMAIN"
+  echo "COLLECTION=$COLLECTION"
+  echo "QUERY=$QUERY"
+
+  RAG_PAYLOAD=$(cat <<EOF
 {
   "query": "${QUERY}",
   "domain": "${DOMAIN}",
@@ -238,10 +244,16 @@ RAG_PAYLOAD=$(cat <<EOF
 EOF
 )
 
-run_rag_query \
-  "rag-query" \
-  "$BASE_URL/api/v1/rag/query" \
-  "$RAG_PAYLOAD"
+  echo
+  printf '%s\n' "[rag-query] REQUEST"
+  echo "$RAG_PAYLOAD"
+
+  run_rag_query \
+    "rag-query:${DOMAIN}" \
+    "$BASE_URL/api/v1/rag/query" \
+    "$RAG_PAYLOAD"
+
+done
 
 # ------------------------------------------------------------------
 # qdrant
