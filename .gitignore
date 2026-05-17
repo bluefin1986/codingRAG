@@ -1,6 +1,7 @@
-output/
 __pycache__/
 .env
 .env.debug
 data/
 .iflycode/
+# Generated chunk/index artifacts
+output/

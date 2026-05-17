@@ -434,7 +434,13 @@ class DomainQueryEngine:
 
     # ── BM25 ──
 
-    def bm25_search(self, query: str, top_k: int = 20) -> List[dict]:
+    def bm25_search(
+        self,
+        query: str,
+        top_k: int = 20,
+        category: Optional[str] = None,
+        has_code: Optional[bool] = None,
+    ) -> List[dict]:
         if not self.bm25_enabled:
             logger.info("BM25 disabled for domain=%s", self.domain)
             return []
@@ -443,7 +449,7 @@ class DomainQueryEngine:
         if searcher is None:
             return []
 
-        keyword_results = searcher.search(query, top_k=top_k)
+        keyword_results = searcher.search(query, top_k=top_k, category=category, has_code=has_code)
         results = []
         for result in keyword_results:
             meta = result.metadata or {}
@@ -543,7 +549,7 @@ class DomainQueryEngine:
             return results
 
         if method == "bm25":
-            results = self.bm25_search(query, top_k=top_k)
+            results = self.bm25_search(query, top_k=top_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("bm25_score")
             self._log_stage("bm25", results)
@@ -554,7 +560,7 @@ class DomainQueryEngine:
         # drop exact API docs before the reranker sees them.
         candidate_k = max(top_k * 40, 200) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
         sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
-        bm25_results = self.bm25_search(query, top_k=candidate_k)
+        bm25_results = self.bm25_search(query, top_k=candidate_k, category=category, has_code=has_code)
         bm25_meta = {
             _result_key(r): {"bm25_rank": rank, "bm25_score": r.get("bm25_score", 0.0)}
             for rank, r in enumerate(bm25_results, 1)

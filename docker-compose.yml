@@ -18,10 +18,11 @@ services:
       CODING_RAG_QDRANT_HOST: qdrant
       CODING_RAG_QDRANT_PORT: "6333"
       CODING_RAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-codingrag-qdrant-secret}
-      CODING_RAG_KEYWORD_BACKEND: ${CODING_RAG_KEYWORD_BACKEND:-local_bm25}
+      CODING_RAG_KEYWORD_BACKEND: ${CODING_RAG_KEYWORD_BACKEND:-opensearch}
       CODING_RAG_ES_URL: ${CODING_RAG_ES_URL:-http://opensearch:9200}
       CODING_RAG_ES_API_KEY: ${CODING_RAG_ES_API_KEY:-}
       CODING_RAG_ES_INDEX_HARMONYOS: ${CODING_RAG_ES_INDEX_HARMONYOS:-codingrag_harmonyos_docs}
+      CODING_RAG_ES_INDEX_IOS: ${CODING_RAG_ES_INDEX_IOS:-codingrag_ios_docs}
     depends_on:
       - qdrant
       - opensearch
@@ -42,7 +43,14 @@ services:
 
   opensearch:
     platform: linux/amd64
-    image: opensearchproject/opensearch:2.19.1
+    build:
+      context: .
+      dockerfile: docker/opensearch/Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    image: ${OPENSEARCH_IMAGE:-codingrag-opensearch-ik:2.19.1}
     container_name: ${OPENSEARCH_CONTAINER_NAME:-codingrag-opensearch}
     ports:
       - "${OPENSEARCH_HTTP_PORT:-9200}:9200"
