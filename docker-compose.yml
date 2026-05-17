@@ -5,9 +5,9 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        HTTP_PROXY: ${HTTP_PROXY:-}
-        HTTPS_PROXY: ${HTTPS_PROXY:-}
-        NO_PROXY: ${NO_PROXY:-}
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
+        NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
     image: ${CODINGRAG_IMAGE:-codingrag:latest}
     container_name: ${CODINGRAG_CONTAINER_NAME:-codingrag-app}
     ports:
