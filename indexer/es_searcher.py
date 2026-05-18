@@ -55,21 +55,20 @@ class ESSearcher(KeywordSearcher):
         if has_code is not None:
             filters.append({"term": {"has_code": has_code}})
 
+        # Keep the OpenSearch BM25 path aligned with the local BM25 baseline:
+        # rank only by the chunk body text. Do not inject query-specific keyword
+        # expansions or title/path/identifier boosts here; those belong in a
+        # separate generic rerank/fusion stage if needed.
         return {
             "size": top_k,
             "query": {
                 "bool": {
                     "must": [
                         {
-                            "multi_match": {
-                                "query": query,
-                                "fields": [
-                                    "context^4",
-                                    "source_file.text^3",
-                                    "identifier_text^3",
-                                    "text^1",
-                                ],
-                                "type": "best_fields",
+                            "match": {
+                                "text": {
+                                    "query": query,
+                                }
                             }
                         }
                     ],
