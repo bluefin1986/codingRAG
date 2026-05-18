@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -100,6 +101,8 @@ def _load_chunks_for_keyword_search(cfg: Dict[str, Any]) -> list:
     domain = cfg["domain"]
 
     if chunks_path.exists():
+        started = time.perf_counter()
+        logger.info("local BM25 chunks load start domain=%s path=%s", domain, chunks_path)
         chunks: list = []
         with open(chunks_path, encoding="utf-8") as f:
             for line in f:
@@ -118,6 +121,8 @@ def _load_chunks_for_keyword_search(cfg: Dict[str, Any]) -> list:
                 compact_record["text"] = keyword_text
                 compact_record["original_text"] = text
                 chunks.append(compact_record)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info("local BM25 chunks load done domain=%s chunks=%d elapsedMs=%d", domain, len(chunks), elapsed_ms)
         return chunks
 
     logger.warning(

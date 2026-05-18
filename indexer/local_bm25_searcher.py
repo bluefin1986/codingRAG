@@ -7,12 +7,17 @@ without changing hybrid retrieval logic.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import jieba
 from rank_bm25 import BM25Okapi
 
 from indexer.keyword_searcher import KeywordSearcher, KeywordSearchResult
+
+
+logger = logging.getLogger(__name__)
 
 
 class LocalBM25Searcher(KeywordSearcher):
@@ -36,13 +41,32 @@ class LocalBM25Searcher(KeywordSearcher):
         if not self.chunks:
             self._bm25 = None
             self._tokenized_corpus = []
+            logger.info("local BM25 build skipped domain=%s chunks=0", self.domain)
             return
 
+        started = time.perf_counter()
+        logger.info("local BM25 build start domain=%s chunks=%d", self.domain, len(self.chunks))
+
+        tokenize_started = time.perf_counter()
         self._tokenized_corpus = [
             list(jieba.cut(str(chunk.get("text") or "")))
             for chunk in self.chunks
         ]
+        tokenize_ms = int((time.perf_counter() - tokenize_started) * 1000)
+        logger.info("local BM25 tokenized domain=%s chunks=%d elapsedMs=%d", self.domain, len(self.chunks), tokenize_ms)
+
+        index_started = time.perf_counter()
         self._bm25 = BM25Okapi(self._tokenized_corpus)
+        index_ms = int((time.perf_counter() - index_started) * 1000)
+        total_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "local BM25 build done domain=%s chunks=%d tokenizeMs=%d indexMs=%d totalMs=%d",
+            self.domain,
+            len(self.chunks),
+            tokenize_ms,
+            index_ms,
+            total_ms,
+        )
 
     def search(
         self,
