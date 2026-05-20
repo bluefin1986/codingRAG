@@ -15,6 +15,7 @@ def _path(value: str | Path) -> Path:
 # ── 服务 ──
 QDRANT_HOST = os.getenv("CODING_RAG_QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("CODING_RAG_QDRANT_PORT", "6333"))
+QDRANT_API_KEY = os.getenv("CODING_RAG_QDRANT_API_KEY", os.getenv("QDRANT_API_KEY", ""))
 AIMODELS_API_BASE = os.getenv("CODING_RAG_AIMODELS_API_BASE", "http://localhost:8030")
 EMBEDDING_API_BASE = os.getenv("CODING_RAG_EMBEDDING_API_BASE", AIMODELS_API_BASE)
 RERANK_API_BASE = os.getenv("CODING_RAG_RERANK_API_BASE", AIMODELS_API_BASE)
@@ -63,6 +64,51 @@ DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
             r'title: "This page requires JavaScript\."\n',
             r"(?m)^- \[Documentation\]\([^\)]*\)\s*$",
         ],
+    },
+    "redis62": {
+        "display_name": "Redis 6.2",
+        "language": "Redis",
+        "docs_dir": PROJECT_ROOT.parent / "redis-docs-md" / "redis62",
+        "collection": "redis62_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "Redis 6.2 技术专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
+    },
+    "kafka28": {
+        "display_name": "Apache Kafka 2.8",
+        "language": "Kafka",
+        "docs_dir": PROJECT_ROOT.parent / "kafka-docs-md" / "kafka28",
+        "collection": "kafka28_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "Apache Kafka 2.8 技术专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
+    },
+    "nginx": {
+        "display_name": "NGINX official docs",
+        "language": "NGINX",
+        "docs_dir": PROJECT_ROOT.parent / "nginx-docs-md" / "nginx",
+        "collection": "nginx_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "NGINX 配置与模块专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
     },
 }
 

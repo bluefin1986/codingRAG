@@ -19,6 +19,7 @@ from config import (
     PROMPT_ROLE,
     QDRANT_HOST,
     QDRANT_PORT,
+    QDRANT_API_KEY,
     RERANK_API_BASE,
     RERANK_MODEL_NAME,
 )
@@ -173,7 +174,8 @@ def semantic_search(
     if must_filters:
         search_body["filter"] = {"must": must_filters}
 
-    client = httpx.Client(timeout=30.0)
+    headers = {"api-key": QDRANT_API_KEY} if QDRANT_API_KEY else None
+    client = httpx.Client(timeout=30.0, headers=headers)
     resp = client.post(
         f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{COLLECTION_NAME}/points/search",
         json=search_body,

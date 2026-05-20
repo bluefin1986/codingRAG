@@ -42,9 +42,12 @@ def check_http(url: str) -> bool:
 def check_qdrant_collection(host: str, port: int, collection: str) -> tuple[bool, str]:
     try:
         import httpx
+        import os
 
         url = f"http://{host}:{port}/collections/{collection}"
-        resp = httpx.get(url, timeout=5.0)
+        api_key = os.getenv("CODING_RAG_QDRANT_API_KEY", os.getenv("QDRANT_API_KEY", ""))
+        headers = {"api-key": api_key} if api_key else None
+        resp = httpx.get(url, timeout=5.0, headers=headers)
         if resp.status_code != 200:
             return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
         data = resp.json().get("result", {})

@@ -30,6 +30,7 @@ from config import (
     OUTPUT_DIR,
     QDRANT_HOST,
     QDRANT_PORT,
+    QDRANT_API_KEY,
     RERANK_MODEL_NAME,
 )
 
@@ -238,7 +239,8 @@ def run_indexing(
     logger.info("embedding done: %d vectors in %.1fs (%.1f vectors/s)", len(embeddings), embed_time, len(embeddings) / embed_time)
 
     # 4. 写入 Qdrant
-    qdrant_client = httpx.Client(base_url=f"http://{QDRANT_HOST}:{QDRANT_PORT}")
+    qdrant_headers = {"api-key": QDRANT_API_KEY} if QDRANT_API_KEY else None
+    qdrant_client = httpx.Client(base_url=f"http://{QDRANT_HOST}:{QDRANT_PORT}", headers=qdrant_headers)
     ensure_collection(qdrant_client, recreate=recreate)
 
     logger.info("building points...")
