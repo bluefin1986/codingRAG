@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import os
+import re
+import shutil
+import tarfile
+import tempfile
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,6 +22,7 @@ from psycopg.types.json import Jsonb
 
 from config import (
     CODING_RAG_DATABASE_URL,
+    CODING_RAG_IMPORT_BATCH_SIZE,
     CODING_RAG_SEAWEEDFS_BUCKET,
     CODING_RAG_SEAWEEDFS_FILER_URL,
     CODING_RAG_SEAWEEDFS_KEY_PREFIX,
@@ -28,6 +35,7 @@ from api.storage import create_storage
 
 TEXT_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".html", ".htm", ".rst"}
 DEFAULT_RETENTION_VERSIONS = 2
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -307,6 +315,615 @@ class DocumentRegistry:
             summary["job_id"] = job_id
             return summary
 
+    def export_library(self, library_id: str, *, archive_format: str = "tar.gz", output_dir: str | None = None) -> dict[str, Any]:
+        self.init_schema()
+        archive_format = (archive_format or "tar.gz").strip().lower()
+        if archive_format not in {"tar.gz", "tgz", "zip"}:
+            raise ValueError("archive format must be tar.gz or zip")
+        archive_format = "tar.gz" if archive_format == "tgz" else archive_format
+        out_dir = Path(output_dir or "output/library-transfers").expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        job_id = str(uuid.uuid4())
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM doc_libraries WHERE id = %s", [library_id])
+            library = cur.fetchone()
+            if not library:
+                raise KeyError(library_id)
+            cur.execute("INSERT INTO library_transfer_jobs (id, library_id, direction, status, dry_run, started_at) VALUES (%s, %s, 'export', 'running', FALSE, now())", [job_id, library_id])
+            conn.commit()
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="codingrag-export-") as tmp_name:
+                tmp = Path(tmp_name)
+                (tmp / "data").mkdir()
+                (tmp / "files").mkdir()
+                with self._connect() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT * FROM doc_libraries WHERE id = %s", [library_id])
+                    library = cur.fetchone()
+                    cur.execute("SELECT * FROM documents WHERE library_id = %s AND deleted_at IS NULL ORDER BY relative_path, doc_key", [library_id])
+                    documents = list(cur.fetchall())
+                    cur.execute(
+                        """
+                        SELECT dv.*, d.doc_key
+                        FROM document_versions dv
+                        JOIN documents d ON d.id = dv.document_id
+                        WHERE d.library_id = %s AND d.deleted_at IS NULL
+                        ORDER BY d.relative_path, dv.version
+                        """,
+                        [library_id],
+                    )
+                    versions = list(cur.fetchall())
+
+                storage_cache: dict[str, Any] = {}
+                checksums: list[str] = []
+                version_exports: list[dict[str, Any]] = []
+                for version in versions:
+                    rel = _export_file_path(version)
+                    content = self._read_version_bytes(version, storage_cache)
+                    target = tmp / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(content)
+                    checksums.append(f"sha256:{hashlib.sha256(content).hexdigest()}  {rel}")
+                    row = dict(version)
+                    row["archive_file"] = rel
+                    version_exports.append(row)
+
+                manifest = {
+                    "format": "codingrag-library-transfer/v1",
+                    "archive_kind": archive_format,
+                    "exported_at": _now_iso(),
+                    "includes": ["manifest", "metadata", "original_files", "checksums"],
+                    "excludes": ["qdrant_snapshots", "opensearch_snapshots"],
+                    "library": to_jsonable(library),
+                    "counts": {"documents": len(documents), "document_versions": len(versions), "files": len(version_exports)},
+                }
+                (tmp / "manifest.json").write_text(json.dumps(to_jsonable(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_jsonl(tmp / "data" / "doc_libraries.jsonl", [library])
+                _write_jsonl(tmp / "data" / "documents.jsonl", documents)
+                _write_jsonl(tmp / "data" / "document_versions.jsonl", version_exports)
+                (tmp / "checksums.txt").write_text("\n".join(checksums) + ("\n" if checksums else ""), encoding="utf-8")
+
+                suffix = ".tar.gz" if archive_format == "tar.gz" else ".zip"
+                archive_name = f"codingrag-{_safe_slug(library['code'])}-{job_id[:8]}{suffix}"
+                archive_path = out_dir / archive_name
+                if archive_format == "zip":
+                    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for path in sorted(tmp.rglob("*")):
+                            if path.is_file():
+                                zf.write(path, path.relative_to(tmp).as_posix())
+                else:
+                    with tarfile.open(archive_path, "w:gz") as tf:
+                        for path in sorted(tmp.rglob("*")):
+                            tf.add(path, arcname=path.relative_to(tmp).as_posix(), recursive=False)
+
+            summary = {"library": {"id": library_id, "code": library["code"], "name": library["name"]}, "archive_path": str(archive_path), "counts": manifest["counts"]}
+            self._finish_transfer_job(job_id, "completed", archive_path=str(archive_path), summary=summary)
+            summary["job_id"] = job_id
+            return summary
+        except Exception as exc:
+            self._finish_transfer_job(job_id, "failed", error_message=str(exc))
+            raise
+
+    def preview_library_import(self, archive_path: str, *, mode: str | None = None, new_library_code: str | None = None) -> dict[str, Any]:
+        try:
+            return self._import_library_archive(archive_path, mode=mode, new_library_code=new_library_code, dry_run=True)
+        except Exception as exc:
+            self._record_failed_transfer_job(archive_path, mode=mode, dry_run=True, error_message=str(exc))
+            raise
+
+    def import_library(self, archive_path: str, *, mode: str | None = None, new_library_code: str | None = None) -> dict[str, Any]:
+        try:
+            return self._import_library_archive(archive_path, mode=mode, new_library_code=new_library_code, dry_run=False)
+        except Exception as exc:
+            self._record_failed_transfer_job(archive_path, mode=mode, dry_run=False, error_message=str(exc))
+            raise
+
+    def enqueue_library_import(self, archive_path: str, *, mode: str | None = None, new_library_code: str | None = None) -> dict[str, Any]:
+        """Create a pending import job and return immediately.
+
+        The API uses this path by default so large archives are handled by an
+        explicit worker process instead of tying work to the HTTP request.
+        """
+        self.init_schema()
+        normalized_mode = self._normalize_import_mode(mode)
+        archive = Path(archive_path).expanduser().resolve()
+        if not archive.is_file():
+            raise FileNotFoundError(str(archive))
+        if normalized_mode == "rename-library" and not new_library_code:
+            raise ValueError("new_library_code is required for rename-library")
+        target_hint = new_library_code.strip().lower() if new_library_code else None
+        if target_hint and not re.fullmatch(r"[0-9a-z][0-9a-z._-]{0,120}", target_hint):
+            raise ValueError("new_library_code/library code contains unsafe characters")
+
+        job_id = str(uuid.uuid4())
+        summary = {
+            "async": True,
+            "dry_run": False,
+            "mode": normalized_mode,
+            "archive_path": str(archive),
+            "new_library_code": target_hint,
+            "batch_size": CODING_RAG_IMPORT_BATCH_SIZE,
+            "total_documents": 0,
+            "processed": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped": 0,
+            "conflict": 0,
+            "failed": 0,
+            "current_doc_key": None,
+            "errors": [],
+        }
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO library_transfer_jobs (id, direction, archive_path, status, mode, dry_run, summary)
+                VALUES (%s, 'import', %s, 'pending', %s, FALSE, %s::jsonb)
+                """,
+                [job_id, str(archive), normalized_mode, Jsonb(to_jsonable(summary))],
+            )
+            conn.commit()
+        summary["job_id"] = job_id
+        summary["status"] = "pending"
+        return summary
+
+    def get_transfer_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM library_transfer_jobs WHERE id = %s", [job_id])
+            return cur.fetchone()
+
+    def _normalize_import_mode(self, mode: str | None) -> str:
+        normalized_mode = (mode or "skip").strip().lower()
+        if normalized_mode not in {"skip", "upsert", "replace-library", "rename-library"}:
+            raise ValueError("mode must be skip, upsert, replace-library, or rename-library")
+        return normalized_mode
+
+    def _import_library_archive(self, archive_path: str, *, mode: str | None, new_library_code: str | None, dry_run: bool) -> dict[str, Any]:
+        self.init_schema()
+        normalized_mode = self._normalize_import_mode(mode)
+        job_id = str(uuid.uuid4())
+        archive = Path(archive_path).expanduser().resolve()
+        if not archive.is_file():
+            raise FileNotFoundError(str(archive))
+
+        with tempfile.TemporaryDirectory(prefix="codingrag-import-") as tmp_name:
+            tmp = Path(tmp_name)
+            _safe_extract_archive(archive, tmp)
+            manifest_path = tmp / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError("archive missing manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("format") != "codingrag-library-transfer/v1":
+                raise ValueError("unsupported archive manifest format")
+            libraries = _read_jsonl(tmp / "data" / "doc_libraries.jsonl")
+            documents = _read_jsonl(tmp / "data" / "documents.jsonl")
+            versions = _read_jsonl(tmp / "data" / "document_versions.jsonl")
+            if len(libraries) != 1:
+                raise ValueError("archive must contain exactly one library")
+            source_library = libraries[0]
+            target_code = (new_library_code or source_library["code"]).strip().lower()
+            if normalized_mode == "rename-library" and not new_library_code:
+                raise ValueError("new_library_code is required for rename-library")
+            if not re.fullmatch(r"[0-9a-z][0-9a-z._-]{0,120}", target_code):
+                raise ValueError("new_library_code/library code contains unsafe characters")
+
+            stats = {"created": 0, "updated": 0, "skipped": 0, "conflict": 0}
+            planned: list[dict[str, Any]] = []
+            doc_by_old_id = {d["id"]: d for d in documents}
+            versions_by_doc: dict[str, list[dict[str, Any]]] = {}
+            for version in versions:
+                rel = _validate_archive_member(version.get("archive_file") or "")
+                if not rel.startswith("files/") or not (tmp / rel).is_file():
+                    raise ValueError(f"missing exported file for version: {rel}")
+                versions_by_doc.setdefault(version["document_id"], []).append(version)
+
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT * FROM doc_libraries WHERE code = %s", [target_code])
+                existing_library = cur.fetchone()
+                if existing_library and not dry_run and not mode:
+                    raise ValueError("target library code already exists; use preview or explicit import mode")
+                if existing_library and normalized_mode == "replace-library":
+                    planned.append({"action": "archive-existing-library", "library_id": existing_library["id"], "code": target_code})
+                elif existing_library and normalized_mode == "rename-library":
+                    raise ValueError(f"target library code already exists: {target_code}")
+
+                target_library_id = existing_library["id"] if existing_library and normalized_mode != "replace-library" else str(uuid.uuid4())
+                for doc in documents:
+                    doc_key = _retarget_doc_key(doc["doc_key"], source_library["code"], target_code)
+                    latest_hash = doc["content_hash"]
+                    cur.execute("SELECT * FROM documents WHERE library_id = %s AND doc_key = %s AND deleted_at IS NULL", [target_library_id, doc_key])
+                    existing_doc = cur.fetchone()
+                    if not existing_doc:
+                        stats["created"] += 1
+                        planned.append({"action": "create", "doc_key": doc_key})
+                    elif existing_doc["content_hash"] == latest_hash:
+                        stats["skipped"] += 1
+                        planned.append({"action": "skip", "doc_key": doc_key})
+                    elif normalized_mode == "upsert":
+                        stats["updated"] += 1
+                        planned.append({"action": "update", "doc_key": doc_key})
+                    elif normalized_mode == "replace-library":
+                        stats["created"] += 1
+                        planned.append({"action": "replace-create", "doc_key": doc_key})
+                    else:
+                        stats["conflict"] += 1
+                        planned.append({"action": "conflict", "doc_key": doc_key})
+
+                summary = {
+                    "dry_run": dry_run,
+                    "mode": normalized_mode,
+                    "archive_path": str(archive),
+                    "source_library": {"id": source_library.get("id"), "code": source_library.get("code"), "name": source_library.get("name")},
+                    "target_library_code": target_code,
+                    "stats": stats,
+                    "planned": planned[:200],
+                }
+                cur.execute(
+                    "INSERT INTO library_transfer_jobs (id, library_id, direction, archive_path, status, mode, dry_run, summary, started_at) VALUES (%s, %s, 'import', %s, 'running', %s, %s, %s::jsonb, now())",
+                    [job_id, existing_library["id"] if existing_library else None, str(archive), normalized_mode, dry_run, Jsonb(to_jsonable(summary))],
+                )
+                if dry_run:
+                    cur.execute("UPDATE library_transfer_jobs SET status = 'completed', finished_at = now() WHERE id = %s", [job_id])
+                    conn.commit()
+                    summary["job_id"] = job_id
+                    return summary
+                if stats["conflict"] and normalized_mode == "skip":
+                    raise ValueError("import has conflicts in skip mode; run preview or use upsert/rename-library")
+
+                if existing_library and normalized_mode == "replace-library":
+                    archived_code = f"{target_code}-archived-{job_id[:8]}"
+                    cur.execute("UPDATE doc_libraries SET code = %s, enabled = FALSE, metadata = metadata || %s::jsonb, updated_at = now() WHERE id = %s", [archived_code, Jsonb({"archived_by_transfer_job": job_id, "archived_from_code": target_code}), existing_library["id"]])
+                    existing_library = None
+                if not existing_library or normalized_mode == "replace-library":
+                    target_library_id = str(uuid.uuid4())
+                    self._insert_imported_library(cur, target_library_id, source_library, target_code)
+                else:
+                    target_library_id = existing_library["id"]
+
+                storage = create_storage(
+                    CODING_RAG_STORAGE_BACKEND,
+                    seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+                    seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+                    seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+                    seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+                )
+                old_to_new_doc_id: dict[str, str] = {}
+                for doc in documents:
+                    doc_key = _retarget_doc_key(doc["doc_key"], source_library["code"], target_code)
+                    doc_versions = sorted(versions_by_doc.get(doc["id"], []), key=lambda v: int(v["version"]))
+                    if not doc_versions:
+                        continue
+                    latest_file = tmp / _validate_archive_member(doc_versions[-1]["archive_file"])
+                    stored = storage.put_existing_file(latest_file, relative_path=doc.get("relative_path") or doc_key)
+                    cur.execute("SELECT * FROM documents WHERE library_id = %s AND doc_key = %s AND deleted_at IS NULL", [target_library_id, doc_key])
+                    existing_doc = cur.fetchone()
+                    if existing_doc and existing_doc["content_hash"] == doc["content_hash"]:
+                        old_to_new_doc_id[doc["id"]] = existing_doc["id"]
+                        continue
+                    if existing_doc and normalized_mode != "upsert":
+                        continue
+                    if existing_doc:
+                        new_doc_id = existing_doc["id"]
+                        old_to_new_doc_id[doc["id"]] = new_doc_id
+                        new_version = int(existing_doc["version"]) + 1
+                        self._update_imported_document(cur, new_doc_id, doc, doc_key, target_library_id, target_code, new_version, stored)
+                        self._insert_imported_version(cur, new_doc_id, doc_versions[-1], new_version, stored)
+                    else:
+                        new_doc_id = str(uuid.uuid4())
+                        old_to_new_doc_id[doc["id"]] = new_doc_id
+                        self._insert_imported_document(cur, new_doc_id, doc, doc_key, target_library_id, target_code, stored)
+                        for version in doc_versions:
+                            version_file = tmp / _validate_archive_member(version["archive_file"])
+                            version_stored = stored if version is doc_versions[-1] else storage.put_existing_file(version_file, relative_path=version.get("relative_path") or doc.get("relative_path") or doc_key)
+                            self._insert_imported_version(cur, new_doc_id, version, int(version["version"]), version_stored)
+                summary["target_library_id"] = target_library_id
+                cur.execute("UPDATE library_transfer_jobs SET library_id = %s, status = 'completed', summary = %s::jsonb, finished_at = now() WHERE id = %s", [target_library_id, Jsonb(to_jsonable(summary)), job_id])
+                conn.commit()
+                summary["job_id"] = job_id
+                return summary
+
+    def run_pending_import_jobs(self, *, limit: int = 1, batch_size: int | None = None) -> list[dict[str, Any]]:
+        """Run pending async import jobs serially. Intended for a CLI worker."""
+        self.init_schema()
+        results: list[dict[str, Any]] = []
+        limit = max(1, limit)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM library_transfer_jobs
+                WHERE direction = 'import' AND status = 'pending' AND dry_run = FALSE
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                [limit],
+            )
+            job_ids = [str(row["id"]) for row in cur.fetchall()]
+        for job_id in job_ids:
+            results.append(self.run_import_job(job_id, batch_size=batch_size))
+        return results
+
+    def run_import_job(self, job_id: str, *, batch_size: int | None = None) -> dict[str, Any]:
+        self.init_schema()
+        batch_size = max(1, int(batch_size or CODING_RAG_IMPORT_BATCH_SIZE or 100))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE library_transfer_jobs
+                SET status = 'running', started_at = COALESCE(started_at, now()), error_message = NULL
+                WHERE id = %s AND direction = 'import' AND dry_run = FALSE AND status IN ('pending', 'failed')
+                RETURNING *
+                """,
+                [job_id],
+            )
+            job = cur.fetchone()
+            if not job:
+                cur.execute("SELECT * FROM library_transfer_jobs WHERE id = %s", [job_id])
+                existing = cur.fetchone()
+                if not existing:
+                    raise KeyError(job_id)
+                return existing
+            conn.commit()
+
+        try:
+            summary = self._run_import_job_archive(job, batch_size=batch_size)
+            return summary
+        except Exception as exc:
+            current = self.get_transfer_job(job_id) or {}
+            summary = dict(current.get("summary") or {})
+            summary.setdefault("errors", []).append({"error": str(exc)[:1000]})
+            self._finish_transfer_job(job_id, "failed", summary=summary, error_message=str(exc)[:2000])
+            raise
+
+    def _run_import_job_archive(self, job: dict[str, Any], *, batch_size: int) -> dict[str, Any]:
+        job_id = str(job["id"])
+        normalized_mode = self._normalize_import_mode(job.get("mode"))
+        archive = Path(job["archive_path"]).expanduser().resolve()
+        if not archive.is_file():
+            raise FileNotFoundError(str(archive))
+        initial_summary = dict(job.get("summary") or {})
+        new_library_code = initial_summary.get("new_library_code")
+
+        with tempfile.TemporaryDirectory(prefix="codingrag-import-job-") as tmp_name:
+            tmp = Path(tmp_name)
+            _safe_extract_archive(archive, tmp)
+            manifest_path = tmp / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError("archive missing manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("format") != "codingrag-library-transfer/v1":
+                raise ValueError("unsupported archive manifest format")
+            libraries = _read_jsonl(tmp / "data" / "doc_libraries.jsonl")
+            documents = _read_jsonl(tmp / "data" / "documents.jsonl")
+            versions = _read_jsonl(tmp / "data" / "document_versions.jsonl")
+            if len(libraries) != 1:
+                raise ValueError("archive must contain exactly one library")
+            source_library = libraries[0]
+            target_code = (new_library_code or source_library["code"]).strip().lower()
+            if normalized_mode == "rename-library" and not new_library_code:
+                raise ValueError("new_library_code is required for rename-library")
+            if not re.fullmatch(r"[0-9a-z][0-9a-z._-]{0,120}", target_code):
+                raise ValueError("new_library_code/library code contains unsafe characters")
+
+            versions_by_doc: dict[str, list[dict[str, Any]]] = {}
+            for version in versions:
+                rel = _validate_archive_member(version.get("archive_file") or "")
+                if not rel.startswith("files/") or not (tmp / rel).is_file():
+                    raise ValueError(f"missing exported file for version: {rel}")
+                versions_by_doc.setdefault(version["document_id"], []).append(version)
+
+            summary = {
+                **initial_summary,
+                "async": True,
+                "dry_run": False,
+                "mode": normalized_mode,
+                "archive_path": str(archive),
+                "source_library": {"id": source_library.get("id"), "code": source_library.get("code"), "name": source_library.get("name")},
+                "target_library_code": target_code,
+                "batch_size": batch_size,
+                "total_documents": len(documents),
+                "processed": 0,
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "conflict": 0,
+                "failed": 0,
+                "current_doc_key": None,
+                "errors": [],
+            }
+
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT * FROM doc_libraries WHERE code = %s", [target_code])
+                existing_library = cur.fetchone()
+                expected_library_id = str(job.get("library_id") or initial_summary.get("target_library_id") or "")
+                if existing_library and normalized_mode == "rename-library" and str(existing_library["id"]) != expected_library_id:
+                    raise ValueError(f"target library code already exists: {target_code}")
+                if existing_library and normalized_mode == "replace-library" and str(existing_library["id"]) != expected_library_id:
+                    archived_code = f"{target_code}-archived-{job_id[:8]}"
+                    cur.execute(
+                        "UPDATE doc_libraries SET code = %s, enabled = FALSE, metadata = metadata || %s::jsonb, updated_at = now() WHERE id = %s",
+                        [archived_code, Jsonb({"archived_by_transfer_job": job_id, "archived_from_code": target_code}), existing_library["id"]],
+                    )
+                    existing_library = None
+                if existing_library:
+                    target_library_id = existing_library["id"]
+                else:
+                    target_library_id = str(uuid.uuid4())
+                    self._insert_imported_library(cur, target_library_id, source_library, target_code)
+                summary["target_library_id"] = target_library_id
+                cur.execute("UPDATE library_transfer_jobs SET library_id = %s, summary = %s::jsonb WHERE id = %s", [target_library_id, Jsonb(to_jsonable(summary)), job_id])
+                conn.commit()
+
+            storage = create_storage(
+                CODING_RAG_STORAGE_BACKEND,
+                seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+                seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+                seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+                seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+            )
+
+            for start in range(0, len(documents), batch_size):
+                batch = documents[start : start + batch_size]
+                with self._connect() as conn:
+                    with conn.transaction():
+                        for doc in batch:
+                            doc_key = _retarget_doc_key(doc["doc_key"], source_library["code"], target_code)
+                            summary["current_doc_key"] = doc_key
+                            try:
+                                with conn.transaction():
+                                    with conn.cursor() as cur:
+                                        action = self._import_one_document(cur, storage, tmp, versions_by_doc, doc, doc_key, summary["target_library_id"], target_code, normalized_mode)
+                                        summary[action] += 1
+                            except Exception as exc:
+                                summary["failed"] += 1
+                                summary["errors"].append({"doc_key": doc_key, "error": str(exc)[:1000]})
+                                summary["errors"] = summary["errors"][-50:]
+                            finally:
+                                summary["processed"] += 1
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE library_transfer_jobs SET summary = %s::jsonb WHERE id = %s", [Jsonb(to_jsonable(summary)), job_id])
+                        conn.commit()
+
+            summary["current_doc_key"] = None
+            status = "completed" if summary["failed"] == 0 else "failed"
+            self._finish_transfer_job(job_id, status, summary=summary, error_message=None if status == "completed" else "one or more documents failed")
+            summary["job_id"] = job_id
+            summary["status"] = status
+            return summary
+
+    def _import_one_document(self, cur, storage, tmp: Path, versions_by_doc: dict[str, list[dict[str, Any]]], doc: dict[str, Any], doc_key: str, target_library_id: str, target_code: str, normalized_mode: str) -> str:
+        doc_versions = sorted(versions_by_doc.get(doc["id"], []), key=lambda v: int(v["version"]))
+        if not doc_versions:
+            return "skipped"
+        cur.execute("SELECT * FROM documents WHERE library_id = %s AND doc_key = %s AND deleted_at IS NULL", [target_library_id, doc_key])
+        existing_doc = cur.fetchone()
+        if existing_doc and existing_doc["content_hash"] == doc["content_hash"] and int(existing_doc["version"]) >= int(doc.get("version") or 1):
+            return "skipped"
+        if existing_doc and normalized_mode == "skip":
+            return "conflict"
+        if existing_doc and normalized_mode not in {"upsert", "replace-library"}:
+            return "conflict"
+
+        latest_file = tmp / _validate_archive_member(doc_versions[-1]["archive_file"])
+        stored = storage.put_existing_file(latest_file, relative_path=doc.get("relative_path") or doc_key)
+        if existing_doc:
+            new_doc_id = existing_doc["id"]
+            new_version = int(existing_doc["version"]) + 1
+            self._update_imported_document(cur, new_doc_id, doc, doc_key, target_library_id, target_code, new_version, stored)
+            self._insert_imported_version(cur, new_doc_id, doc_versions[-1], new_version, stored)
+            return "updated"
+
+        new_doc_id = str(uuid.uuid4())
+        self._insert_imported_document(cur, new_doc_id, doc, doc_key, target_library_id, target_code, stored)
+        for version in doc_versions:
+            version_file = tmp / _validate_archive_member(version["archive_file"])
+            version_stored = stored if version is doc_versions[-1] else storage.put_existing_file(version_file, relative_path=version.get("relative_path") or doc.get("relative_path") or doc_key)
+            self._insert_imported_version(cur, new_doc_id, version, int(version["version"]), version_stored)
+        return "created"
+
+    def _read_version_bytes(self, version: dict[str, Any], storage_cache: dict[str, Any]) -> bytes:
+        backend = version.get("storage_backend") or CODING_RAG_STORAGE_BACKEND
+        if backend not in storage_cache:
+            storage_cache[backend] = create_storage(
+                backend,
+                seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+                seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+                seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+                seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+            )
+        text = storage_cache[backend].read_text(version.get("storage_path") or "", storage_key=version.get("storage_key"), encoding="utf-8")
+        return text.encode("utf-8")
+
+    def _insert_imported_library(self, cur, library_id: str, source: dict[str, Any], target_code: str) -> None:
+        cur.execute(
+            """
+            INSERT INTO doc_libraries (
+              id, code, name, description, domain, source_type, source_uri, root_path, enabled, version,
+              retrieval_mode, embedding_model, embedding_model_name, embedding_dim, rerank_model_name,
+              keyword_backend, qdrant_collection, opensearch_index, metadata
+            ) VALUES (%s, %s, %s, %s, %s, 'archive', %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            [
+                library_id, target_code, source.get("name") or target_code, source.get("description"), target_code,
+                source.get("source_uri"), source.get("enabled", True), source.get("version") or "1.0.0",
+                source.get("retrieval_mode") or "hybrid_rerank", source.get("embedding_model"), source.get("embedding_model_name"),
+                source.get("embedding_dim"), source.get("rerank_model_name"), source.get("keyword_backend"),
+                source.get("qdrant_collection"), source.get("opensearch_index"), Jsonb(source.get("metadata") or {}),
+            ],
+        )
+
+    def _insert_imported_document(self, cur, doc_id: str, source: dict[str, Any], doc_key: str, library_id: str, target_code: str, stored) -> None:
+        cur.execute(
+            """
+            INSERT INTO documents (
+              id, library_id, domain, doc_key, title, source_url, source_file, local_path, relative_path,
+              mime_type, language, content_hash, content_length, version, enabled, status, index_required,
+              chunk_count, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s::jsonb)
+            """,
+            [
+                doc_id, library_id, target_code, doc_key, source.get("title") or doc_key, source.get("source_url"),
+                source.get("source_file"), stored.storage_path or "", source.get("relative_path") or doc_key,
+                source.get("mime_type"), source.get("language"), source.get("content_hash"), source.get("content_length") or 0,
+                source.get("version") or 1, source.get("enabled", True), source.get("status") or "changed",
+                source.get("chunk_count") or 0, Jsonb(source.get("metadata") or {}),
+            ],
+        )
+
+    def _update_imported_document(self, cur, doc_id: str, source: dict[str, Any], doc_key: str, library_id: str, target_code: str, new_version: int, stored) -> None:
+        cur.execute(
+            """
+            UPDATE documents SET
+              title = %s, source_url = %s, source_file = %s, local_path = %s, relative_path = %s,
+              mime_type = %s, language = %s, content_hash = %s, content_length = %s, version = %s,
+              enabled = %s, status = 'changed', index_required = TRUE, error_message = NULL, updated_at = now(), metadata = %s::jsonb
+            WHERE id = %s
+            """,
+            [
+                source.get("title") or doc_key, source.get("source_url"), source.get("source_file"), stored.storage_path or "",
+                source.get("relative_path") or doc_key, source.get("mime_type"), source.get("language"), source.get("content_hash"),
+                source.get("content_length") or 0, new_version, source.get("enabled", True), Jsonb(source.get("metadata") or {}), doc_id,
+            ],
+        )
+
+    def _insert_imported_version(self, cur, doc_id: str, source: dict[str, Any], version: int, stored) -> None:
+        cur.execute(
+            """
+            INSERT INTO document_versions (
+              id, document_id, version, content_hash, content_length, title, source_url, source_file, relative_path,
+              storage_path, storage_backend, storage_bucket, storage_key, storage_etag, storage_size,
+              storage_status, change_type, tombstone, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (document_id, version) DO NOTHING
+            """,
+            [
+                str(uuid.uuid4()), doc_id, version, source.get("content_hash"), source.get("content_length") or 0,
+                source.get("title"), source.get("source_url"), source.get("source_file"), source.get("relative_path") or "",
+                stored.storage_path, stored.storage_backend, stored.storage_bucket, stored.storage_key, stored.storage_etag,
+                stored.storage_size, stored.storage_status, source.get("change_type") or "update", source.get("tombstone", False),
+                Jsonb(source.get("metadata") or {}),
+            ],
+        )
+
+    def _record_failed_transfer_job(self, archive_path: str, *, mode: str | None, dry_run: bool, error_message: str) -> None:
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO library_transfer_jobs (id, direction, archive_path, status, mode, dry_run, summary, error_message, started_at, finished_at) VALUES (%s, 'import', %s, 'failed', %s, %s, '{}'::jsonb, %s, now(), now())",
+                    [str(uuid.uuid4()), archive_path, (mode or "skip").strip().lower(), dry_run, error_message[:2000]],
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("failed to record failed import transfer job")
+
+    def _finish_transfer_job(self, job_id: str, status: str, *, archive_path: str | None = None, summary: dict[str, Any] | None = None, error_message: str | None = None) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE library_transfer_jobs SET status = %s, archive_path = COALESCE(%s, archive_path), summary = COALESCE(%s::jsonb, summary), error_message = %s, finished_at = now() WHERE id = %s",
+                [status, archive_path, Jsonb(to_jsonable(summary)) if summary is not None else None, error_message, job_id],
+            )
+            conn.commit()
+
     def _upsert_library(self, cur, domain: str, cfg: dict[str, Any], docs_dir: Path) -> str:
         library_id = str(uuid.uuid4())
         name = cfg.get("display_name") or domain
@@ -566,6 +1183,96 @@ def derive_title(content: str, path: Path) -> str:
             if title:
                 return title[:300]
     return path.stem.replace("-", " ").replace("_", " ")[:300] or path.name
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(to_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise ValueError(f"archive missing {path.name}")
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def _safe_slug(value: str) -> str:
+    value = re.sub(r"[^0-9A-Za-z._=-]+", "-", (value or "library").strip())
+    return value.strip(".-_") or "library"
+
+
+def _export_file_path(version: dict[str, Any]) -> str:
+    doc_key = _safe_slug(version.get("doc_key") or version.get("document_id") or "doc")
+    rel = version.get("relative_path") or version.get("source_file") or "document.txt"
+    suffix = Path(rel).suffix or ".txt"
+    name = _safe_slug(Path(rel).name or f"v{version.get('version')}{suffix}")
+    return f"files/{doc_key}/v{int(version.get('version') or 1):04d}-{name}"
+
+
+def _validate_archive_member(name: str) -> str:
+    if not name or "\x00" in name:
+        raise ValueError("unsafe empty archive path")
+    normalized = name.replace("\\", "/")
+    p = Path(normalized)
+    if p.is_absolute() or any(part in {"", ".", ".."} for part in p.parts):
+        raise ValueError(f"unsafe archive path: {name}")
+    return p.as_posix()
+
+
+def _safe_extract_archive(archive: Path, target: Path) -> None:
+    suffixes = "".join(archive.suffixes).lower()
+    if suffixes.endswith(".zip"):
+        with zipfile.ZipFile(archive) as zf:
+            for info in zf.infolist():
+                rel = _validate_archive_member(info.filename)
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError(f"unsafe symlink in archive: {info.filename}")
+                dest = (target / rel).resolve()
+                if target.resolve() not in dest.parents and dest != target.resolve():
+                    raise ValueError(f"archive path escapes target: {info.filename}")
+                if info.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, dest.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        return
+    with tarfile.open(archive, "r:*") as tf:
+        for member in tf.getmembers():
+            rel = _validate_archive_member(member.name)
+            if member.issym() or member.islnk() or member.isdev():
+                raise ValueError(f"unsafe tar member: {member.name}")
+            dest = (target / rel).resolve()
+            if target.resolve() not in dest.parents and dest != target.resolve():
+                raise ValueError(f"archive path escapes target: {member.name}")
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                src = tf.extractfile(member)
+                if src is None:
+                    raise ValueError(f"cannot read tar member: {member.name}")
+                with src, dest.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+
+def _retarget_doc_key(doc_key: str, source_code: str, target_code: str) -> str:
+    prefix = f"{source_code}:"
+    if doc_key.startswith(prefix):
+        return f"{target_code}:{doc_key[len(prefix):]}"
+    return f"{target_code}:{doc_key}"
 
 
 SCHEMA_SQL = """

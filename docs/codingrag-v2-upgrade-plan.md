@@ -592,6 +592,17 @@ POST   /api/libraries/import
 GET    /api/library-transfer-jobs/:id
 ```
 
+#### 4.4.6 大批量导入异步化（Phase 2.1）
+
+- `POST /api/libraries/import` 默认只创建 `library_transfer_jobs` 记录并立即返回 `job_id`；`/preview` 继续同步 dry-run。
+- 兼容同步导入：请求体或 query 可传 `async=false`，仅用于小归档/调试。
+- Worker 通过 `python3 scripts/library_import_worker.py --once` 或 `--job-id <job_id>` 串行处理导入，避免 HTTP 请求承载大文件入库。
+- Docker Compose 提供常驻内部服务 `library-import-worker`，命令为 `python3 scripts/library_import_worker.py`，通过 PostgreSQL 轮询 `library_transfer_jobs` 消费待处理导入任务。
+- `library-import-worker` 不暴露任何 `ports`，不提供外部 HTTP 入口；进度统一由 API 的 `GET /api/library-transfer-jobs/:id` 查询。
+- 批处理大小由 `CODING_RAG_IMPORT_BATCH_SIZE` 控制，默认 100；SeaweedFS 上传默认不并发。
+- Job summary 增量记录 `total_documents / processed / created / updated / skipped / conflict / failed / current_doc_key / errors`，便于前端轮询 `GET /api/library-transfer-jobs/:id` 展示进度。
+- 导入按 `library_code + doc_key + content_hash + version` 做幂等跳过；单文档失败写入 errors，已成功批次不回滚。
+
 ### 4.5 Retriever 调试增强
 
 新增 debug search API，返回完整检索链路。
@@ -803,6 +814,7 @@ offset
 3. 实现 `library import --dry-run`，输出新增、更新、跳过、冲突统计。
 4. 实现 `library import --mode skip|upsert|replace-library|rename-library`。
 5. 导入后标记需要重建索引，默认不跨环境直接复用 Qdrant / OpenSearch 索引。
+6. 在 `docker-compose.yml` 中提供常驻 `library-import-worker` 内部服务，复用 app 镜像并执行 `python3 scripts/library_import_worker.py`，不开放外部端口。
 
 验收：
 

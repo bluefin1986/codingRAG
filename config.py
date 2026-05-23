@@ -35,6 +35,7 @@ CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL = os.getenv("CODING_RAG_SEAWEEDFS_PUBLIC_BA
 CODING_RAG_SEAWEEDFS_BUCKET = os.getenv("CODING_RAG_SEAWEEDFS_BUCKET", "codingrag-originals").strip()
 CODING_RAG_SEAWEEDFS_KEY_PREFIX = os.getenv("CODING_RAG_SEAWEEDFS_KEY_PREFIX", "libraries").strip().strip("/")
 CODING_RAG_SEAWEEDFS_S3_ENDPOINT = os.getenv("CODING_RAG_SEAWEEDFS_S3_ENDPOINT", "").strip().rstrip("/")
+CODING_RAG_IMPORT_BATCH_SIZE = int(os.getenv("CODING_RAG_IMPORT_BATCH_SIZE", "100"))
 
 # ── 领域/语言注册表 ──
 # 新增语言/技术栈时，只需要在这里加一个 entry。

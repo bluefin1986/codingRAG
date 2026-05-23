@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class RagQueryRequest(BaseModel):
@@ -39,3 +39,21 @@ class RagQueryResponse(BaseModel):
     method: str
     context: str
     results: List[RagResultItem]
+
+
+class LibraryExportRequest(BaseModel):
+    """POST /api/libraries/{library_id}/export request body."""
+
+    format: str = Field("tar.gz", description="Archive format: tar.gz or zip")
+    output_dir: Optional[str] = Field(None, description="Optional server-side output directory")
+
+
+class LibraryImportRequest(BaseModel):
+    """POST /api/libraries/import(/preview) request body."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    archive_path: str = Field(..., min_length=1, description="Server-side archive path from export or upload staging")
+    mode: Optional[str] = Field(None, description="skip / upsert / replace-library / rename-library")
+    new_library_code: Optional[str] = Field(None, description="Target library code for rename-library imports")
+    async_import: bool = Field(True, alias="async", description="Enqueue actual imports as async jobs by default")

@@ -30,9 +30,36 @@ services:
       CODING_RAG_SEAWEEDFS_BUCKET: ${CODING_RAG_SEAWEEDFS_BUCKET:-codingrag-originals}
       CODING_RAG_SEAWEEDFS_KEY_PREFIX: ${CODING_RAG_SEAWEEDFS_KEY_PREFIX:-libraries}
       CODING_RAG_SEAWEEDFS_S3_ENDPOINT: ${CODING_RAG_SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs-filer:8333}
+      CODING_RAG_IMPORT_BATCH_SIZE: ${CODING_RAG_IMPORT_BATCH_SIZE:-100}
     depends_on:
       - qdrant
       - opensearch
+      - postgres
+      - seaweedfs-filer
+    restart: unless-stopped
+
+  library-import-worker:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
+        NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
+    image: ${CODINGRAG_IMAGE:-codingrag:latest}
+    container_name: ${CODINGRAG_IMPORT_WORKER_CONTAINER_NAME:-codingrag-library-import-worker}
+    command: python3 scripts/library_import_worker.py
+    environment:
+      CODING_RAG_DATABASE_URL: ${CODING_RAG_DATABASE_URL:-postgresql://codingrag:codingrag@postgres:5432/codingrag}
+      CODING_RAG_STORAGE_BACKEND: ${CODING_RAG_STORAGE_BACKEND:-seaweedfs}
+      CODING_RAG_SEAWEEDFS_FILER_URL: ${CODING_RAG_SEAWEEDFS_FILER_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL: ${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_SEAWEEDFS_BUCKET: ${CODING_RAG_SEAWEEDFS_BUCKET:-codingrag-originals}
+      CODING_RAG_SEAWEEDFS_KEY_PREFIX: ${CODING_RAG_SEAWEEDFS_KEY_PREFIX:-libraries}
+      CODING_RAG_SEAWEEDFS_S3_ENDPOINT: ${CODING_RAG_SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs-filer:8333}
+      CODING_RAG_IMPORT_BATCH_SIZE: ${CODING_RAG_IMPORT_BATCH_SIZE:-100}
+    depends_on:
       - postgres
       - seaweedfs-filer
     restart: unless-stopped

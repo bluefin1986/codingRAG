@@ -40,7 +40,13 @@ from config import DOMAIN_REGISTRY  # noqa: E402
 
 from api.engine import DomainQueryEngine  # noqa: E402
 from api.registry import DocumentRegistry, RegistryUnavailable  # noqa: E402
-from api.schemas import RagQueryRequest, RagQueryResponse, RagResultItem  # noqa: E402
+from api.schemas import (  # noqa: E402
+    LibraryExportRequest,
+    LibraryImportRequest,
+    RagQueryRequest,
+    RagQueryResponse,
+    RagResultItem,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("codingrag.api")
@@ -239,6 +245,65 @@ def disable_doc(document_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+
+@app.post("/api/libraries/{library_id}/export")
+def export_library(library_id: str, req: Optional[LibraryExportRequest] = None):
+    req = req or LibraryExportRequest()
+    try:
+        return _get_registry().export_library(library_id, archive_format=req.format, output_dir=req.output_dir)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Library not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("export_library failed for library_id=%s", library_id)
+        raise HTTPException(status_code=500, detail=f"Failed to export library: {e}")
+
+
+@app.post("/api/libraries/import/preview")
+def preview_library_import(req: LibraryImportRequest):
+    try:
+        return _get_registry().preview_library_import(req.archive_path, mode=req.mode, new_library_code=req.new_library_code)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("preview_library_import failed")
+        raise HTTPException(status_code=500, detail=f"Failed to preview library import: {e}")
+
+
+@app.post("/api/libraries/import")
+def import_library(req: LibraryImportRequest, async_: Optional[bool] = Query(None, alias="async")):
+    try:
+        use_async = req.async_import if async_ is None else async_
+        if use_async:
+            return _get_registry().enqueue_library_import(req.archive_path, mode=req.mode, new_library_code=req.new_library_code)
+        return _get_registry().import_library(req.archive_path, mode=req.mode, new_library_code=req.new_library_code)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("import_library failed")
+        raise HTTPException(status_code=500, detail=f"Failed to import library: {e}")
+
+
+@app.get("/api/library-transfer-jobs/{job_id}")
+def get_library_transfer_job(job_id: str):
+    try:
+        job = _get_registry().get_transfer_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("get_library_transfer_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get transfer job: {e}")
+    if not job:
+        raise HTTPException(status_code=404, detail="Transfer job not found")
+    return job
 
 
 @app.post("/api/libraries/{library_id}/retention/preview")
