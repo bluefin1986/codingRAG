@@ -193,18 +193,56 @@ def _result_key(r: dict) -> tuple:
     return (r.get("source_file", ""), r.get("chunk_index", r.get("context", "")))
 
 
+def _extract_technical_symbols(query: str) -> list[str]:
+    """Extract domain-agnostic technical symbols from a query.
+
+    This intentionally relies on token shape rather than product/domain names:
+    config keys (`cleanup.policy`), directives (`try_files`), commands (`XREADGROUP`),
+    API identifiers (`generateRandomUUID`, `UIButton`), package-ish names, etc.
+    """
+    import re
+
+    generic_stop = {
+        "http", "https", "request", "error", "code", "docs", "usage", "config",
+        "configuration", "command", "directive", "nginx", "redis", "kafka", "ios", "arkui",
+    }
+    raw_tokens = re.findall(r"[@A-Za-z_][A-Za-z0-9_@./:-]{2,}", query)
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_tokens:
+        token = raw.strip(".,;:()[]{}<>`'\"").lower()
+        if len(token) < 3 or token in generic_stop or token in seen:
+            continue
+        has_symbol_shape = (
+            "_" in token
+            or "." in token
+            or "@" in token
+            or "/" in token
+            or "-" in token
+            or any(c.isupper() for c in raw)
+            or raw.isupper()
+        )
+        if has_symbol_shape:
+            symbols.append(token)
+            seen.add(token)
+    return symbols
+
+
 def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[str]:
     """Return discriminative query terms according to the current collection IDF."""
     import jieba
     generic_stop = {"怎么", "如何", "什么", "为何", "为什么", "是否", "怎样", "的", "了", "和", "与", "或", "在", "是", "有", "中"}
     terms: list[str] = []
     seen = set()
+    for symbol in _extract_technical_symbols(query):
+        terms.append(symbol)
+        seen.add(symbol)
     for raw in jieba.cut(query):
         term = raw.strip().lower()
-        if len(term) < 2 or term in generic_stop:
+        if len(term) < 2 or term in generic_stop or term in seen:
             continue
         idf = float(getattr(bm25, "idf", {}).get(raw, getattr(bm25, "idf", {}).get(term, 0.0)) or 0.0)
-        if idf >= min_idf and term not in seen:
+        if idf >= min_idf:
             terms.append(term)
             seen.add(term)
     return terms
@@ -243,18 +281,68 @@ def _drop_obvious_noise(results: List[dict], query: str = "", threshold: float =
     return kept or results[:1]
 
 
-def _field_match_rerank(results: List[dict], query: str, bm25: Any) -> List[dict]:
-    """Promote results whose title/path matches discriminative query terms.
+def _field_match_text(r: dict) -> str:
+    return " ".join([
+        str(r.get("context", "")),
+        str(r.get("source_file", "")),
+        str(r.get("text", "") or "")[:2000],
+    ]).lower()
 
-    This is collection-driven via BM25 IDF, not a domain-specific stopword list.
-    It separates title/path API hits from broad body-only examples.
+
+def _technical_symbol_match_count(r: dict, symbols: list[str]) -> int:
+    if not symbols:
+        return 0
+    field_text = _field_match_text(r)
+    return sum(1 for symbol in symbols if symbol in field_text)
+
+
+def _protect_symbol_bm25_hits(results: List[dict], bm25_results: List[dict], query: str, limit: int = 8) -> List[dict]:
+    """Keep exact technical-symbol BM25 hits in the candidate pool.
+
+    Generic hybrid protection: if a query contains exact technical symbols and
+    BM25 found chunks whose title/path/text contain them, those chunks should not
+    be completely displaced by broader semantic neighbors before rerank/final top-k.
+    """
+    symbols = _extract_technical_symbols(query)
+    if not symbols or not bm25_results:
+        return results
+
+    existing = {_result_key(r) for r in results}
+    protected: list[dict] = []
+    for rank, raw in enumerate(bm25_results, 1):
+        if len(protected) >= limit:
+            break
+        if _result_key(raw) in existing:
+            continue
+        match_count = _technical_symbol_match_count(raw, symbols)
+        if not match_count:
+            continue
+        item = raw.copy()
+        item["score"] = float(item.get("bm25_score", item.get("score", 0.0)) or 0.0) + match_count * 10.0 + 20.0 / rank
+        item["bm25_rank"] = rank
+        item["symbol_matches"] = match_count
+        protected.append(item)
+        existing.add(_result_key(item))
+
+    if not protected:
+        return results
+    merged = results + protected
+    merged.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+    return merged
+
+
+def _field_match_rerank(results: List[dict], query: str, bm25: Any) -> List[dict]:
+    """Promote results whose title/path/text matches discriminative query terms.
+
+    This is collection-driven via BM25 IDF plus shape-based technical symbols;
+    it is intentionally domain-agnostic.
     """
     terms = _query_high_idf_terms(query, bm25)
     if not terms:
         return results
 
     def field_score(r: dict) -> int:
-        field_text = f"{r.get('context', '')} {r.get('source_file', '')}".lower()
+        field_text = _field_match_text(r)
         return sum(1 for t in terms if t in field_text)
 
     for r in results:
@@ -547,9 +635,23 @@ class DomainQueryEngine:
         )
 
         if method == "semantic":
-            results = self.semantic_search(query, top_k=top_k, category=category, has_code=has_code)
+            # Keep semantic mode mostly vector-based, but use a wider pool and
+            # domain-agnostic technical-symbol rerank so exact identifiers like
+            # `try_files`, `cleanup.policy`, `XREADGROUP` are not lost when they
+            # appear in vector candidates below topK.
+            candidate_k = max(top_k * 20, 100) if _extract_technical_symbols(query) else top_k
+            results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("semantic_score")
+            symbols = _extract_technical_symbols(query)
+            if symbols:
+                for r in results:
+                    matches = _technical_symbol_match_count(r, symbols)
+                    if matches:
+                        r["symbol_matches"] = matches
+                        r["score"] = float(r.get("score", 0.0) or 0.0) + matches * 2.0
+                results.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
+            results = results[:top_k]
             self._log_stage("semantic", results)
             return results
 
@@ -591,6 +693,7 @@ class DomainQueryEngine:
             )
             fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
             fused = identifier_boost(fused, query, boost_per_match=1.0)
+            fused = _protect_symbol_bm25_hits(fused, bm25_results, query, limit=max(top_k, 8))
         for item in fused:
             item.update(bm25_meta.get(_result_key(item), {}))
         self._log_stage("fusion", fused)

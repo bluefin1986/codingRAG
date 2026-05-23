@@ -308,6 +308,7 @@ print_title "codingRAG API regression test"
 
 echo "BASE_URL=$BASE_URL"
 echo "QDRANT_URL=$QDRANT_URL"
+echo "RUN_SEMANTIC_TESTS=${RUN_SEMANTIC_TESTS:-1}"
 
 # ------------------------------------------------------------------
 # 基础检查
@@ -344,75 +345,46 @@ run_rag_query \
   "Button,onClick,ArkUI" \
   "button,onclick"
 
-run_rag_query \
-  "rag:redis62:GET" \
-  "redis62" \
-  "Redis 6.2 GET command usage" \
-  "bm25" \
-  5 \
-  "null" \
-  "GET,Redis 6.2,command" \
-  "get"
+# ------------------------------------------------------------------
+# English exact-anchor tests: verify keyword/BM25 path and indexed anchors.
+# ------------------------------------------------------------------
 
-run_rag_query \
-  "rag:redis62:XREADGROUP" \
-  "redis62" \
-  "Redis 6.2 XREADGROUP consumer group" \
-  "bm25" \
-  5 \
-  "null" \
-  "XREADGROUP,consumer,group" \
-  "xreadgroup"
+run_rag_query "rag:redis62:GET:en:bm25" "redis62" "Redis 6.2 GET command usage" "bm25" 5 "null" "GET,Redis 6.2,command" "get"
+run_rag_query "rag:redis62:XREADGROUP:en:bm25" "redis62" "Redis 6.2 XREADGROUP consumer group" "bm25" 5 "null" "XREADGROUP,consumer,group" "xreadgroup"
+run_rag_query "rag:kafka28:cleanup.policy:en:bm25" "kafka28" "Kafka 2.8 topic cleanup.policy configuration" "bm25" 5 "null" "cleanup.policy,delete,compact" "topic,config"
+run_rag_query "rag:kafka28:producer-acks:en:bm25" "kafka28" "Kafka 2.8 producer acks configuration" "bm25" 5 "null" "acks,producer,all" "producer,config"
+run_rag_query "rag:nginx:proxy_pass:en:bm25" "nginx" "nginx proxy_pass directive" "bm25" 5 "null" "proxy_pass,proxy,Directive" "proxy"
+run_rag_query "rag:nginx:try_files:en:bm25" "nginx" "nginx try_files directive" "bm25" 5 "null" "try_files,uri,file" "core,try_files"
+run_rag_query "rag:nginx:worker_processes:en:bm25" "nginx" "nginx worker_processes directive" "bm25" 5 "null" "worker_processes,processes" "core,worker_processes"
 
-run_rag_query \
-  "rag:kafka28:cleanup.policy" \
-  "kafka28" \
-  "Kafka 2.8 topic cleanup.policy configuration" \
-  "bm25" \
-  5 \
-  "null" \
-  "cleanup.policy,delete,compact" \
-  "topic,config"
+# ------------------------------------------------------------------
+# Bilingual bge-m3 semantic/hybrid tests.
+#
+# These paired cases verify Chinese query -> English docs and English query -> English docs
+# both hit the same target anchors. They require the embedding service to be reachable.
+# Set RUN_SEMANTIC_TESTS=0 to run only API/BM25 smoke tests.
+# ------------------------------------------------------------------
 
-run_rag_query \
-  "rag:kafka28:producer-acks" \
-  "kafka28" \
-  "Kafka 2.8 producer acks configuration" \
-  "bm25" \
-  5 \
-  "null" \
-  "acks,producer,all" \
-  "producer,config"
+if [[ "${RUN_SEMANTIC_TESTS:-1}" == "1" ]]; then
+  for METHOD in semantic hybrid; do
+    run_rag_query "rag:redis62:GET:zh:${METHOD}" "redis62" "Redis 6.2 怎么读取字符串 key 的值" "$METHOD" 5 "null" "GET,Redis 6.2,command" "get"
+    run_rag_query "rag:redis62:GET:en:${METHOD}" "redis62" "Redis 6.2 get string value by key" "$METHOD" 5 "null" "GET,Redis 6.2,command" "get"
+    run_rag_query "rag:redis62:XREADGROUP:zh:${METHOD}" "redis62" "Redis 消费组怎么读取 stream 消息" "$METHOD" 5 "null" "XREADGROUP,consumer,group" "xreadgroup"
+    run_rag_query "rag:redis62:XREADGROUP:en:${METHOD}" "redis62" "Redis XREADGROUP read stream messages with consumer group" "$METHOD" 5 "null" "XREADGROUP,consumer,group" "xreadgroup"
 
-run_rag_query \
-  "rag:nginx:proxy_pass" \
-  "nginx" \
-  "nginx proxy_pass directive" \
-  "bm25" \
-  5 \
-  "null" \
-  "proxy_pass,proxy,Directive" \
-  "proxy"
+    run_rag_query "rag:kafka28:cleanup.policy:zh:${METHOD}" "kafka28" "Kafka 2.8 topic 如何配置日志删除或压缩策略" "$METHOD" 5 "null" "cleanup.policy,delete,compact" "topic,config"
+    run_rag_query "rag:kafka28:cleanup.policy:en:${METHOD}" "kafka28" "Kafka 2.8 topic log cleanup delete compact policy" "$METHOD" 5 "null" "cleanup.policy,delete,compact" "topic,config"
+    run_rag_query "rag:kafka28:producer-acks:zh:${METHOD}" "kafka28" "Kafka 2.8 producer 如何配置 acks 保证写入确认" "$METHOD" 5 "null" "acks,producer,all" "producer,config"
+    run_rag_query "rag:kafka28:producer-acks:en:${METHOD}" "kafka28" "Kafka 2.8 producer acks acknowledgement configuration" "$METHOD" 5 "null" "acks,producer,all" "producer,config"
 
-run_rag_query \
-  "rag:nginx:try_files" \
-  "nginx" \
-  "nginx try_files directive" \
-  "bm25" \
-  5 \
-  "null" \
-  "try_files,uri,file" \
-  "core,try_files"
-
-run_rag_query \
-  "rag:nginx:worker_processes" \
-  "nginx" \
-  "nginx worker_processes directive" \
-  "bm25" \
-  5 \
-  "null" \
-  "worker_processes,processes" \
-  "core,worker_processes"
+    run_rag_query "rag:nginx:proxy_pass:zh:${METHOD}" "nginx" "nginx 如何配置反向代理转发到后端服务" "$METHOD" 5 "null" "proxy_pass,proxy,Directive" "proxy"
+    run_rag_query "rag:nginx:proxy_pass:en:${METHOD}" "nginx" "nginx reverse proxy pass to upstream backend" "$METHOD" 5 "null" "proxy_pass,proxy,Directive" "proxy"
+    run_rag_query "rag:nginx:try_files:zh:${METHOD}" "nginx" "nginx 如何按顺序查找静态文件 try_files" "$METHOD" 5 "null" "try_files,uri,file" "core,try_files"
+    run_rag_query "rag:nginx:try_files:en:${METHOD}" "nginx" "nginx try_files search files in order" "$METHOD" 5 "null" "try_files,uri,file" "core,try_files"
+  done
+else
+  echo "Skipping semantic/hybrid bilingual tests because RUN_SEMANTIC_TESTS=${RUN_SEMANTIC_TESTS:-0}"
+fi
 
 # ------------------------------------------------------------------
 # Qdrant collection presence
