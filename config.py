@@ -5,7 +5,14 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency may be absent in legacy installs
+    load_dotenv = None
+
 PROJECT_ROOT = Path(__file__).resolve().parent
+if load_dotenv:
+    load_dotenv(PROJECT_ROOT / ".env")
 
 
 def _path(value: str | Path) -> Path:
@@ -19,6 +26,15 @@ QDRANT_API_KEY = os.getenv("CODING_RAG_QDRANT_API_KEY", os.getenv("QDRANT_API_KE
 AIMODELS_API_BASE = os.getenv("CODING_RAG_AIMODELS_API_BASE", "http://localhost:8030")
 EMBEDDING_API_BASE = os.getenv("CODING_RAG_EMBEDDING_API_BASE", AIMODELS_API_BASE)
 RERANK_API_BASE = os.getenv("CODING_RAG_RERANK_API_BASE", AIMODELS_API_BASE)
+
+# ── Document Registry / 原文存储 ──
+CODING_RAG_DATABASE_URL = os.getenv("CODING_RAG_DATABASE_URL", "").strip()
+CODING_RAG_STORAGE_BACKEND = os.getenv("CODING_RAG_STORAGE_BACKEND", "local").strip().lower()
+CODING_RAG_SEAWEEDFS_FILER_URL = os.getenv("CODING_RAG_SEAWEEDFS_FILER_URL", "").strip().rstrip("/")
+CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL = os.getenv("CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL", CODING_RAG_SEAWEEDFS_FILER_URL).strip().rstrip("/")
+CODING_RAG_SEAWEEDFS_BUCKET = os.getenv("CODING_RAG_SEAWEEDFS_BUCKET", "codingrag-originals").strip()
+CODING_RAG_SEAWEEDFS_KEY_PREFIX = os.getenv("CODING_RAG_SEAWEEDFS_KEY_PREFIX", "libraries").strip().strip("/")
+CODING_RAG_SEAWEEDFS_S3_ENDPOINT = os.getenv("CODING_RAG_SEAWEEDFS_S3_ENDPOINT", "").strip().rstrip("/")
 
 # ── 领域/语言注册表 ──
 # 新增语言/技术栈时，只需要在这里加一个 entry。

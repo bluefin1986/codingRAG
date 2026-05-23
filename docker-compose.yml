@@ -24,17 +24,18 @@ services:
       CODING_RAG_ES_INDEX_HARMONYOS: ${CODING_RAG_ES_INDEX_HARMONYOS:-codingrag_harmonyos_docs}
       CODING_RAG_ES_INDEX_IOS: ${CODING_RAG_ES_INDEX_IOS:-codingrag_ios_docs}
       CODING_RAG_DATABASE_URL: ${CODING_RAG_DATABASE_URL:-postgresql://codingrag:codingrag@postgres:5432/codingrag}
-      CODING_RAG_STORAGE_BACKEND: ${CODING_RAG_STORAGE_BACKEND:-fastdfs}
-      CODING_RAG_FASTDFS_TRACKER: ${CODING_RAG_FASTDFS_TRACKER:-fastdfs-tracker:22122}
-      CODING_RAG_FASTDFS_DOWNLOAD_BASE_URL: ${CODING_RAG_FASTDFS_DOWNLOAD_BASE_URL:-http://fastdfs-storage:8888}
+      CODING_RAG_STORAGE_BACKEND: ${CODING_RAG_STORAGE_BACKEND:-seaweedfs}
+      CODING_RAG_SEAWEEDFS_FILER_URL: ${CODING_RAG_SEAWEEDFS_FILER_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL: ${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_SEAWEEDFS_BUCKET: ${CODING_RAG_SEAWEEDFS_BUCKET:-codingrag-originals}
+      CODING_RAG_SEAWEEDFS_KEY_PREFIX: ${CODING_RAG_SEAWEEDFS_KEY_PREFIX:-libraries}
+      CODING_RAG_SEAWEEDFS_S3_ENDPOINT: ${CODING_RAG_SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs-filer:8333}
     depends_on:
       - qdrant
       - opensearch
       - postgres
-      - fastdfs-tracker
-      - fastdfs-storage
+      - seaweedfs-filer
     restart: unless-stopped
-
 
   postgres:
     platform: linux/amd64
@@ -50,31 +51,40 @@ services:
       - ${POSTGRES_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data
     restart: unless-stopped
 
-  fastdfs-tracker:
-    platform: linux/amd64
-    image: ${FASTDFS_IMAGE:-delron/fastdfs:latest}
-    container_name: ${FASTDFS_TRACKER_CONTAINER_NAME:-codingrag-fastdfs-tracker}
-    command: tracker
+  seaweedfs-master:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
+    container_name: ${SEAWEEDFS_MASTER_CONTAINER_NAME:-codingrag-seaweedfs-master}
+    command: "master -ip=seaweedfs-master -ip.bind=0.0.0.0"
     ports:
-      - "${FASTDFS_TRACKER_PORT:-22122}:22122"
+      - "${SEAWEEDFS_MASTER_PORT:-9333}:9333"
     volumes:
-      - ${FASTDFS_TRACKER_DATA_DIR:-./data/fastdfs/tracker}:/var/fdfs
+      - ${SEAWEEDFS_MASTER_DATA_DIR:-./data/seaweedfs/master}:/data
     restart: unless-stopped
 
-  fastdfs-storage:
-    platform: linux/amd64
-    image: ${FASTDFS_IMAGE:-delron/fastdfs:latest}
-    container_name: ${FASTDFS_STORAGE_CONTAINER_NAME:-codingrag-fastdfs-storage}
-    command: storage
-    environment:
-      TRACKER_SERVER: ${FASTDFS_TRACKER_SERVER:-fastdfs-tracker:22122}
+  seaweedfs-volume:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
+    container_name: ${SEAWEEDFS_VOLUME_CONTAINER_NAME:-codingrag-seaweedfs-volume}
+    command: "volume -mserver=seaweedfs-master:9333 -ip=seaweedfs-volume -ip.bind=0.0.0.0 -dir=/data -max=${SEAWEEDFS_VOLUME_MAX:-7}"
     ports:
-      - "${FASTDFS_STORAGE_PORT:-23000}:23000"
-      - "${FASTDFS_HTTP_PORT:-8888}:8888"
+      - "${SEAWEEDFS_VOLUME_PORT:-8080}:8080"
     volumes:
-      - ${FASTDFS_STORAGE_DATA_DIR:-./data/fastdfs/storage}:/var/fdfs
+      - ${SEAWEEDFS_VOLUME_DATA_DIR:-./data/seaweedfs/volume}:/data
     depends_on:
-      - fastdfs-tracker
+      - seaweedfs-master
+    restart: unless-stopped
+
+  seaweedfs-filer:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:latest}
+    container_name: ${SEAWEEDFS_FILER_CONTAINER_NAME:-codingrag-seaweedfs-filer}
+    command: "filer -master=seaweedfs-master:9333 -ip=seaweedfs-filer -ip.bind=0.0.0.0 -s3 -s3.port=8333"
+    ports:
+      - "${SEAWEEDFS_FILER_PORT:-8888}:8888"
+      - "${SEAWEEDFS_S3_PORT:-8333}:8333"
+    volumes:
+      - ${SEAWEEDFS_FILER_DATA_DIR:-./data/seaweedfs/filer}:/data
+    depends_on:
+      - seaweedfs-master
+      - seaweedfs-volume
     restart: unless-stopped
 
   qdrant:

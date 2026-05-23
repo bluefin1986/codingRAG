@@ -101,26 +101,26 @@ PostgreSQL 只保存文档库、文档、版本、chunk 元数据、索引状态
 ```text
 原始文档文件 / Markdown / HTML / PDF
   ↓
-对象存储：FastDFS / MinIO / S3 兼容存储
+对象存储：SeaweedFS / MinIO / S3 兼容存储
   ↓
 PostgreSQL：只记录 storage_key、hash、版本、启停状态、来源信息
   ↓
 Qdrant / OpenSearch：只保存 chunk 与可回溯 payload
 ```
 
-#### 4.0.1 FastDFS 是否合适
+#### 4.0.1 SeaweedFS / S3 兼容存储选择
 
-FastDFS 可以用，尤其适合已有内网部署、只需要文件上传下载、追求轻量的场景。但从后续迁移、备份、权限、生态工具和本地开发便利性看，更推荐优先考虑 **MinIO / S3 兼容对象存储**。
+codingRAG 原始文档优先采用 **SeaweedFS**：本地 Docker 部署轻量，原生提供 filer HTTP 与 S3-compatible API，后续迁移到 MinIO / S3 生态也更顺滑。FastDFS 不再作为推荐实现路径，避免额外上传服务、SDK/运维生态弱和跨环境迁移成本高的问题。
 
 建议判断：
 
 | 方案 | 适用情况 | 风险 |
 |------|----------|------|
-| FastDFS | 公司已有稳定 FastDFS，运维熟悉，只做内网文件存储 | 生态和迁移工具弱一些，跨环境导出要自己封装 |
-| MinIO / S3 | 希望本地、测试、生产统一；希望备份、迁移、生命周期管理更标准 | 需要额外部署对象存储服务 |
+| SeaweedFS | 希望轻量部署，同时保留 HTTP/S3 访问能力；适合作为默认本地/内网对象存储 | 需要维护 master/volume/filer 三个服务 |
+| MinIO / S3 | 希望本地、测试、生产完全统一；希望备份、迁移、生命周期管理更标准 | 需要额外部署对象存储服务 |
 | 本地文件目录 | 开发期最简单 | 多环境同步差，不适合作为长期唯一来源 |
 
-推荐抽象为 `ObjectStorage` 接口，第一版可以本地文件目录或 MinIO，若现网已经有 FastDFS，则实现 FastDFS adapter。业务层不要绑定具体存储。
+推荐抽象为 `ObjectStorage` 接口，第一版支持 local 与 SeaweedFS，业务层不要绑定具体存储。
 
 #### 4.0.2 原始文档定位
 
@@ -160,7 +160,7 @@ GET /api/docs/:id/content?version=3
 `document_versions` 增加对象存储字段：
 
 ```sql
-ALTER TABLE document_versions ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'local'; -- local / fastdfs / s3 / minio
+ALTER TABLE document_versions ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'local'; -- local / seaweedfs / s3 / minio
 ALTER TABLE document_versions ADD COLUMN storage_bucket TEXT;
 ALTER TABLE document_versions ADD COLUMN storage_key TEXT;
 ALTER TABLE document_versions ADD COLUMN storage_etag TEXT;
@@ -185,10 +185,19 @@ CREATE TABLE doc_libraries (
   root_path TEXT,                     -- 环境本地路径，不作为跨环境强约束
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   version TEXT NOT NULL DEFAULT '1.0.0',
+  retrieval_mode TEXT NOT NULL DEFAULT 'hybrid_rerank', -- semantic / bm25 / hybrid / hybrid_rerank
+  embedding_model TEXT,
+  embedding_model_name TEXT,
+  embedding_dim INTEGER,
+  rerank_model_name TEXT,
+  keyword_backend TEXT,              -- opensearch / local_bm25 / none
+  qdrant_collection TEXT,
+  opensearch_index TEXT,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK (source_type IN ('filesystem', 'git', 'archive'))
+  CHECK (source_type IN ('filesystem', 'git', 'archive')),
+  CHECK (retrieval_mode IN ('semantic', 'bm25', 'hybrid', 'hybrid_rerank'))
 );
 
 CREATE INDEX idx_doc_libraries_domain ON doc_libraries(domain);
@@ -200,7 +209,17 @@ CREATE INDEX idx_doc_libraries_enabled ON doc_libraries(enabled);
 - 定义一个可整体迁移的文档库边界。
 - 支持启用 / 禁用整个文档库。
 - 记录文档库当前版本号、来源、根路径和元数据。
+- 显式记录该文档库的检索模式、embedding 模型、rerank 模型、关键词后端和索引名称。
 - 作为导出 / 导入的最小单位。
+
+检索配置必须进入 `doc_libraries`，不能只留在 `config.py`：
+
+- `retrieval_mode`：默认建议 `hybrid_rerank`，可按文档库覆盖。
+- `embedding_model / embedding_model_name / embedding_dim`：用于判断索引是否需要重建。
+- `rerank_model_name`：用于检索链路可追踪和跨环境迁移。
+- `keyword_backend / qdrant_collection / opensearch_index`：用于说明该文档库当前派生索引落点。
+
+当上述任一配置变化时，应将该文档库下文档标记 `index_required=true`，避免新模型读取旧向量索引。
 
 ### 4.1.2 文档表：`documents`
 
@@ -271,7 +290,7 @@ CREATE TABLE document_versions (
   source_file TEXT,
   relative_path TEXT NOT NULL,
   storage_path TEXT,                 -- 兼容字段：归档后的原文路径或对象存储 key
-  storage_backend TEXT NOT NULL DEFAULT 'local', -- local / fastdfs / s3 / minio
+  storage_backend TEXT NOT NULL DEFAULT 'local', -- local / seaweedfs / s3 / minio
   storage_bucket TEXT,
   storage_key TEXT,
   storage_etag TEXT,
@@ -284,7 +303,7 @@ CREATE TABLE document_versions (
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE(document_id, version),
   CHECK (change_type IN ('create', 'update', 'delete', 'restore')),
-  CHECK (storage_backend IN ('local', 'fastdfs', 's3', 'minio')),
+  CHECK (storage_backend IN ('local', 'seaweedfs', 's3', 'minio', 'fastdfs')), -- fastdfs 仅用于兼容历史记录
   CHECK (storage_status IN ('active', 'deleting', 'deleted', 'missing'))
 );
 
@@ -618,7 +637,7 @@ codingRAG 管理
 字段：
 
 ```text
-Domain | Title | Source | Hash | Status | Chunks | Indexed At | Actions
+Domain | Title | Source | Retrieval Mode | Embedding | Rerank | Hash | Status | Chunks | Indexed At | Actions
 ```
 
 操作：
@@ -757,10 +776,11 @@ offset
 1. 新增 PostgreSQL registry，Phase 1 必做 `doc_libraries / documents / document_versions / library_transfer_jobs`；`document_chunks` 可先做 metadata-only 或延后到 per-doc indexing 阶段。
 2. 实现扫描原始 docs 目录。
 3. 计算 hash、提取 title/source_file/domain/relative_path/doc_key。
-4. 实现文档库与文档列表 API。
-5. 实现文档详情和原文 API。
-6. 支持文档库与单文档启用 / 禁用。
-7. 抽象原始文档 ObjectStorage，至少支持 local；如现网确认则增加 FastDFS adapter。
+4. 从 domain config 写入 retrieval_mode、embedding_model、embedding_dim、rerank_model_name、keyword_backend、qdrant_collection、opensearch_index。
+5. 实现文档库与文档列表 API。
+6. 实现文档详情和原文 API。
+7. 支持文档库与单文档启用 / 禁用。
+7. 抽象原始文档 ObjectStorage，支持 local 与 SeaweedFS；默认通过 SeaweedFS filer HTTP 写入原始文档，并保留 S3-compatible 端口便于后续迁移。
 8. 实现最多保留 2 个文档版本的 retention preview/run。
 
 验收：

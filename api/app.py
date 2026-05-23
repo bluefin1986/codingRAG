@@ -18,9 +18,9 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # Ensure project root is on sys.path so `config` and `indexer` are importable.
@@ -39,6 +39,7 @@ from config import (
 from config import DOMAIN_REGISTRY  # noqa: E402
 
 from api.engine import DomainQueryEngine  # noqa: E402
+from api.registry import DocumentRegistry, RegistryUnavailable  # noqa: E402
 from api.schemas import RagQueryRequest, RagQueryResponse, RagResultItem  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -60,6 +61,7 @@ app.add_middleware(
 
 # ── Engine cache: one engine per domain, lazily created ──
 _engines: Dict[str, DomainQueryEngine] = {}
+_registry: DocumentRegistry | None = None
 
 
 def _get_engine(domain: str) -> DomainQueryEngine:
@@ -78,6 +80,13 @@ def _get_engine(domain: str) -> DomainQueryEngine:
     _engines[domain] = engine
     logger.info("Created engine for domain=%s (collection=%s)", domain, cfg["collection"])
     return engine
+
+
+def _get_registry() -> DocumentRegistry:
+    global _registry
+    if _registry is None:
+        _registry = DocumentRegistry()
+    return _registry
 
 
 def _preload_domains(domains_str: str) -> None:
@@ -108,6 +117,13 @@ def _on_startup() -> None:
     preload_env = os.getenv("CODING_RAG_PRELOAD_DOMAINS", "").strip()
     if preload_env:
         _preload_domains(preload_env)
+    try:
+        _get_registry().init_schema()
+        logger.info("Document registry schema initialized")
+    except RegistryUnavailable:
+        logger.info("Document registry disabled: CODING_RAG_DATABASE_URL is not configured")
+    except Exception:
+        logger.exception("Document registry schema initialization failed")
 
 
 # ── Endpoints ──
@@ -119,6 +135,123 @@ def health():
         "default_domain": ACTIVE_DOMAIN,
         "available_domains": sorted(DOMAIN_REGISTRY.keys()),
     }
+
+
+@app.get("/api/libraries")
+def list_libraries():
+    try:
+        return {"items": _get_registry().list_libraries()}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_libraries failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list libraries: {e}")
+
+
+@app.post("/api/docs/scan")
+def scan_docs(
+    domain: str = Query(..., description="Domain/library code to scan, e.g. ios or redis62"),
+    limit: Optional[int] = Query(None, ge=1, le=10000, description="Optional safety limit for sample scans"),
+):
+    try:
+        return _get_registry().scan_domain(domain, limit=limit).__dict__
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("scan_docs failed for domain=%s", domain)
+        raise HTTPException(status_code=500, detail=f"Failed to scan docs: {e}")
+
+
+@app.get("/api/docs")
+def list_docs(
+    domain: Optional[str] = None,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        return _get_registry().list_documents(domain=domain, status=status, q=q, limit=limit, offset=offset)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_docs failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list docs: {e}")
+
+
+@app.get("/api/docs/{document_id}")
+def get_doc(document_id: str):
+    try:
+        doc = _get_registry().get_document(document_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("get_doc failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get doc: {e}")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@app.get("/api/docs/{document_id}/content")
+def get_doc_content(document_id: str, version: Optional[int] = Query(None, ge=1)):
+    try:
+        content = _get_registry().get_document_content(document_id, version=version)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Stored content missing: {e}")
+    except Exception as e:
+        logger.exception("get_doc_content failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get doc content: {e}")
+    if not content:
+        raise HTTPException(status_code=404, detail="Document/version not found")
+    return content
+
+
+@app.post("/api/docs/{document_id}/enable")
+def enable_doc(document_id: str):
+    try:
+        doc = _get_registry().set_document_enabled(document_id, True)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("enable_doc failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to enable doc: {e}")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@app.post("/api/docs/{document_id}/disable")
+def disable_doc(document_id: str):
+    try:
+        doc = _get_registry().set_document_enabled(document_id, False)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("disable_doc failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to disable doc: {e}")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@app.post("/api/libraries/{library_id}/retention/preview")
+def retention_preview(library_id: str, keep: int = Query(2, ge=1, le=100)):
+    try:
+        return _get_registry().retention_preview(library_id, keep=keep)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Library not found")
+    except Exception as e:
+        logger.exception("retention_preview failed for library_id=%s", library_id)
+        raise HTTPException(status_code=500, detail=f"Failed to build retention preview: {e}")
 
 
 @app.post("/api/v1/rag/query", response_model=RagQueryResponse)
