@@ -40,9 +40,12 @@ logger = logging.getLogger(__name__)
 NOISE_PATTERNS = [re.compile(pattern) for pattern in NOISE_PATTERN_STRINGS]
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, noise_pattern_strings: Optional[List[str]] = None) -> str:
     """清洗文档噪声。"""
-    for pat in NOISE_PATTERNS:
+    patterns = NOISE_PATTERNS
+    if noise_pattern_strings is not None:
+        patterns = [re.compile(pattern) for pattern in noise_pattern_strings]
+    for pat in patterns:
         text = pat.sub("", text)
     # 合并连续空行
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -57,7 +60,14 @@ def truncate_text(text: str, max_chars: int = 1500) -> str:
 
 
 # ── Embedding API ──
-def embed_texts(texts: List[str], batch_size: int = 32, max_retries: int = 3) -> List[List[float]]:
+def embed_texts(
+    texts: List[str],
+    batch_size: int = 32,
+    max_retries: int = 3,
+    *,
+    api_base: str | None = None,
+    model_name: str | None = None,
+) -> List[List[float]]:
     """调用 aimodels 服务批量生成 embedding，带重试和进度显示。"""
     import time as _time
     all_embeddings: List[List[float]] = []
@@ -77,8 +87,8 @@ def embed_texts(texts: List[str], batch_size: int = 32, max_retries: int = 3) ->
         for attempt in range(max_retries):
             try:
                 resp = client.post(
-                    f"{EMBEDDING_API_BASE}/api/v1/embeddings",
-                    json={"input": batch, "model": EMBEDDING_MODEL_NAME},
+                    f"{api_base or EMBEDDING_API_BASE}/api/v1/embeddings",
+                    json={"input": batch, "model": model_name or EMBEDDING_MODEL_NAME},
                 )
                 resp.raise_for_status()
                 data = resp.json()

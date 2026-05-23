@@ -37,6 +37,10 @@ CODING_RAG_SEAWEEDFS_KEY_PREFIX = os.getenv("CODING_RAG_SEAWEEDFS_KEY_PREFIX", "
 CODING_RAG_SEAWEEDFS_S3_ENDPOINT = os.getenv("CODING_RAG_SEAWEEDFS_S3_ENDPOINT", "").strip().rstrip("/")
 CODING_RAG_IMPORT_BATCH_SIZE = int(os.getenv("CODING_RAG_IMPORT_BATCH_SIZE", "100"))
 
+# ── Elasticsearch / OpenSearch ──
+CODING_RAG_ES_URL = os.getenv("CODING_RAG_ES_URL", "").strip().rstrip("/")
+CODING_RAG_ES_API_KEY = os.getenv("CODING_RAG_ES_API_KEY", "").strip()
+
 # ── 领域/语言注册表 ──
 # 新增语言/技术栈时，只需要在这里加一个 entry。
 DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {

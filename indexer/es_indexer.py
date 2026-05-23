@@ -131,6 +131,27 @@ class ESIndexer:
                     "has_code": {"type": "boolean"},
                     "chunk_index": {"type": "integer"},
                     "chunk_pos": {"type": "integer"},
+                    "doc_id": {"type": "keyword"},
+                    "library_id": {"type": "keyword"},
+                    "title": {
+                        "type": "text",
+                        "analyzer": "zh_index_analyzer",
+                        "search_analyzer": "zh_search_analyzer",
+                        "fields": {"keyword": {"type": "keyword"}},
+                    },
+                    "source_url": {"type": "keyword"},
+                    "relative_path": {
+                        "type": "keyword",
+                        "fields": {
+                            "text": {
+                                "type": "text",
+                                "analyzer": "path_ngram_analyzer",
+                            }
+                        },
+                    },
+                    "content_hash": {"type": "keyword"},
+                    "document_version": {"type": "integer"},
+                    "chunk_id": {"type": "keyword"},
                 }
             },
         }
@@ -253,6 +274,104 @@ class ESIndexer:
             self.delete_domain(target_domain)
 
         return self.index_chunks(chunks, domain=target_domain)
+
+    def delete_by_doc_id(self, doc_id: str) -> None:
+        """Delete all indexed entries for a specific document."""
+        payload = {
+            "query": {
+                "term": {
+                    "doc_id": doc_id,
+                }
+            }
+        }
+        resp = self.client.post(
+            f"{self.base_url}/{self.index_name}/_delete_by_query",
+            headers=self._headers(),
+            json=payload,
+        )
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+        logger.info("deleted ES entries for doc_id=%s index=%s", doc_id, self.index_name)
+
+    def index_document_chunks(
+        self,
+        chunks: Iterable[Dict[str, Any]],
+        *,
+        refresh: bool = True,
+        batch_size: int = 1000,
+    ) -> int:
+        """Bulk index pre-built document chunk records.
+
+        Each input record should have the full per-document payload:
+        doc_id, library_id, domain, title, source_url, source_file,
+        relative_path, content_hash, document_version, chunk_index,
+        chunk_id, text, context, has_code, category.
+        """
+        lines: List[str] = []
+        count = 0
+
+        def flush_bulk() -> None:
+            nonlocal lines
+            if not lines:
+                return
+            payload = "\n".join(lines) + "\n"
+            bulk_resp = self.client.post(
+                f"{self.base_url}/_bulk",
+                headers=self._headers(ndjson=True),
+                content=payload.encode("utf-8"),
+            )
+            bulk_resp.raise_for_status()
+            bulk_data = bulk_resp.json()
+            if bulk_data.get("errors"):
+                errors = [item for item in bulk_data.get("items", []) if item.get("index", {}).get("error")]
+                raise RuntimeError(f"ES bulk index failed: {errors[:3]}")
+            lines = []
+
+        for record in chunks:
+            chunk_id = record.get("chunk_id", "")
+            text = record.get("text", "") or ""
+            context = record.get("context", "") or ""
+            source_file = record.get("source_file", "") or ""
+            doc_id = record.get("doc_id", "")
+
+            document = {
+                "doc_id": doc_id,
+                "library_id": record.get("library_id", ""),
+                "domain": record.get("domain", ""),
+                "title": record.get("title", ""),
+                "source_url": record.get("source_url", ""),
+                "source_file": source_file,
+                "relative_path": record.get("relative_path", ""),
+                "content_hash": record.get("content_hash", ""),
+                "document_version": record.get("document_version", 0),
+                "chunk_index": record.get("chunk_index", 0),
+                "text": text,
+                "context": context,
+                "identifier_text": _extract_identifier_text(text=text, context=context, source_file=source_file),
+                "has_code": bool(record.get("has_code", False)),
+                "category": record.get("category", ""),
+            }
+
+            lines.append(json.dumps({"index": {"_index": self.index_name, "_id": chunk_id}}, ensure_ascii=False))
+            lines.append(json.dumps(document, ensure_ascii=False))
+            count += 1
+            if count % batch_size == 0:
+                flush_bulk()
+
+        flush_bulk()
+        if count == 0:
+            return 0
+
+        if refresh:
+            refresh_resp = self.client.post(
+                f"{self.base_url}/{self.index_name}/_refresh",
+                headers=self._headers(),
+            )
+            refresh_resp.raise_for_status()
+
+        logger.info("indexed %d document chunk keyword docs into %s", count, self.index_name)
+        return count
 
     @staticmethod
     def _doc_id(*, domain: str, source_file: str, chunk_index: int, pos: int) -> str:

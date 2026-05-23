@@ -269,6 +269,128 @@ class DocumentRegistry:
             conn.commit()
             return row
 
+    def update_document_content(
+        self,
+        document_id: str,
+        content_bytes: bytes,
+        *,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a document with new content.
+
+        Steps:
+        1. Load document from PG, verify enabled and not deleted
+        2. Compute content hash of new content
+        3. If hash matches current version, return 'unchanged'
+        4. Upload new file to storage (SeaweedFS or local)
+        5. Create new document_versions row (version + 1)
+        6. Update documents.version to new version, set index_required=true, status='changed'
+        7. Return new version info
+
+        Document versions are immutable — never modifies existing version rows.
+        """
+        self.init_schema()
+
+        # 1. Load document
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.*, l.code AS library_code
+                FROM documents d
+                JOIN doc_libraries l ON l.id = d.library_id
+                WHERE d.id = %s AND d.deleted_at IS NULL
+                """,
+                [document_id],
+            )
+            doc = cur.fetchone()
+        if not doc:
+            raise FileNotFoundError(f"Document not found: {document_id}")
+        if not doc["enabled"]:
+            raise ValueError(f"Document is disabled: {document_id}")
+
+        # 2. Compute content hash
+        new_hash = hashlib.sha256(content_bytes).hexdigest()
+
+        # 3. Check if unchanged
+        if new_hash == doc["content_hash"]:
+            return {
+                "document_id": document_id,
+                "status": "unchanged",
+                "version": int(doc["version"]),
+                "content_hash": new_hash,
+            }
+
+        # 4. Upload to storage
+        relative_path = doc["relative_path"] or doc["doc_key"]
+        storage = create_storage(
+            CODING_RAG_STORAGE_BACKEND,
+            seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+            seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+            seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+            seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+        )
+        # Write content to a temp file, then upload via storage
+        suffix = Path(relative_path).suffix or ".md"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content_bytes)
+            tmp_path = Path(tmp.name)
+        try:
+            stored = storage.put_existing_file(tmp_path, relative_path=relative_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        # 5 & 6. Create new version row and update document
+        new_version = int(doc["version"]) + 1
+        new_length = len(content_bytes)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO document_versions (
+                    id, document_id, version, content_hash, content_length,
+                    title, source_url, source_file, relative_path,
+                    storage_path, storage_backend, storage_bucket, storage_key,
+                    storage_etag, storage_size, storage_status, change_type, tombstone
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, 'update', FALSE
+                )
+                """,
+                [
+                    str(uuid.uuid4()), document_id, new_version, new_hash, new_length,
+                    doc["title"], doc.get("source_url"), doc.get("source_file"), relative_path,
+                    stored.storage_path, stored.storage_backend, stored.storage_bucket, stored.storage_key,
+                    stored.storage_etag, stored.storage_size, stored.storage_status,
+                ],
+            )
+            cur.execute(
+                """
+                UPDATE documents
+                SET version = %s,
+                    content_hash = %s,
+                    content_length = %s,
+                    status = 'changed',
+                    index_required = TRUE,
+                    error_message = NULL,
+                    updated_at = now()
+                WHERE id = %s AND deleted_at IS NULL
+                """,
+                [new_version, new_hash, new_length, document_id],
+            )
+            conn.commit()
+
+        # 7. Return result
+        return {
+            "document_id": document_id,
+            "status": "changed",
+            "version": new_version,
+            "content_hash": new_hash,
+            "content_length": new_length,
+            "storage_backend": stored.storage_backend,
+            "storage_status": stored.storage_status,
+        }
+
     def retention_preview(self, library_id: str, *, keep: int = DEFAULT_RETENTION_VERSIONS) -> dict[str, Any]:
         self.init_schema()
         keep = max(1, keep)

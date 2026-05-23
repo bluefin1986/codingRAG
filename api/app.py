@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # Ensure project root is on sys.path so `config` and `indexer` are importable.
@@ -40,6 +40,7 @@ from config import DOMAIN_REGISTRY  # noqa: E402
 
 from api.engine import DomainQueryEngine  # noqa: E402
 from api.registry import DocumentRegistry, RegistryUnavailable  # noqa: E402
+from indexer.per_doc_indexer import DocumentDisabled, DocumentNotFound, PerDocumentIndexer  # noqa: E402
 from api.schemas import (  # noqa: E402
     LibraryExportRequest,
     LibraryImportRequest,
@@ -189,6 +190,39 @@ def list_docs(
         raise HTTPException(status_code=500, detail=f"Failed to list docs: {e}")
 
 
+@app.post("/api/docs/reindex")
+def reindex_changed_docs(
+    domain: str = Query(..., description="Domain whose changed documents should be reindexed"),
+    changed_only: bool = Query(True, description="Only index enabled documents that require indexing"),
+):
+    if not changed_only:
+        raise HTTPException(status_code=400, detail="Only changed_only=true indexing is supported")
+    try:
+        return PerDocumentIndexer().reindex_changed(domain)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("reindex_changed_docs failed for domain=%s", domain)
+        raise HTTPException(status_code=502, detail=f"Failed to reindex changed docs: {e}")
+
+
+@app.post("/api/docs/{document_id}/reindex")
+def reindex_doc(document_id: str):
+    try:
+        return PerDocumentIndexer().index_document(document_id)
+    except DocumentNotFound:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except DocumentDisabled as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("reindex_doc failed for document_id=%s", document_id)
+        raise HTTPException(status_code=502, detail=f"Failed to reindex document: {e}")
+
+
 @app.get("/api/docs/{document_id}")
 def get_doc(document_id: str):
     try:
@@ -217,6 +251,63 @@ def get_doc_content(document_id: str, version: Optional[int] = Query(None, ge=1)
     if not content:
         raise HTTPException(status_code=404, detail="Document/version not found")
     return content
+
+
+@app.put("/api/docs/{document_id}/content")
+async def update_doc_content(
+    document_id: str,
+    reindex: bool = Query(False, description="Automatically reindex after content update"),
+    file: Optional[UploadFile] = File(None, description="File upload (multipart/form-data)"),
+    content: Optional[str] = Form(None, description="Text content (alternative to file upload)"),
+):
+    """Update document content with a new version.
+
+    Accepts either:
+    - multipart/form-data with a `file` field
+    - multipart/form-data with a `content` text field
+    - JSON body with a `content` field (via application/x-www-form-urlencoded)
+
+    After update, call POST /api/docs/{document_id}/reindex to apply changes,
+    or pass ?reindex=true to auto-reindex.
+    """
+    try:
+        content_bytes: bytes | None = None
+        filename: str | None = None
+
+        if file is not None:
+            content_bytes = await file.read()
+            filename = file.filename
+        elif content is not None:
+            content_bytes = content.encode("utf-8")
+            filename = "content.md"
+        else:
+            raise HTTPException(status_code=400, detail="Either 'file' or 'content' field is required")
+
+        registry = _get_registry()
+        result = registry.update_document_content(
+            document_id,
+            content_bytes,
+            filename=filename,
+        )
+
+        if reindex and result.get("status") == "changed":
+            try:
+                index_result = PerDocumentIndexer().index_document(document_id)
+                result["reindex"] = index_result
+            except Exception as exc:
+                logger.exception("Auto-reindex failed after content update for %s", document_id)
+                result["reindex"] = {"error": str(exc)}
+
+        return result
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("update_doc_content failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to update document content: {e}")
 
 
 @app.post("/api/docs/{document_id}/enable")
