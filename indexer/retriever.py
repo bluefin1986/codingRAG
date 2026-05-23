@@ -12,16 +12,12 @@ from tqdm import tqdm
 
 from config import (
     ACTIVE_DOMAIN,
-    CHUNKS_FILE,
-    COLLECTION_NAME,
     EMBEDDING_API_BASE,
-    EMBEDDING_MODEL_NAME,
-    PROMPT_ROLE,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_API_KEY,
     RERANK_API_BASE,
-    RERANK_MODEL_NAME,
+    get_domain_config,
 )
 
 from indexer.es_searcher import ESSearcher
@@ -30,14 +26,20 @@ from indexer.local_bm25_searcher import LocalBM25Searcher
 logger = logging.getLogger(__name__)
 
 
+def _active_config() -> Dict[str, Any]:
+    """Resolve the legacy single-domain entry point only when it is executed."""
+    return get_domain_config(ACTIVE_DOMAIN)
+
+
 # ── Embedding ──
 
 def embed_query(query: str) -> List[float]:
     """将查询文本转为 embedding 向量。"""
+    cfg = _active_config()
     client = httpx.Client(timeout=60.0)
     resp = client.post(
         f"{EMBEDDING_API_BASE}/api/v1/embeddings",
-        json={"input": [query], "model": EMBEDDING_MODEL_NAME},
+        json={"input": [query], "model": cfg["embedding_model_name"]},
     )
     resp.raise_for_status()
     client.close()
@@ -61,6 +63,7 @@ def _keyword_search_text(record: dict) -> str:
 @lru_cache(maxsize=1)
 def _load_keyword_searcher():
     """Load keyword search backend for legacy retriever.py entry points."""
+    cfg = _active_config()
     backend = os.getenv("CODING_RAG_KEYWORD_BACKEND", "local_bm25").strip().lower()
 
     if backend in ("elasticsearch", "opensearch", "es"):
@@ -90,7 +93,7 @@ def _load_keyword_searcher():
             backend,
         )
 
-    chunks_path = CHUNKS_FILE
+    chunks_path = cfg["output_dir"] / "chunks.jsonl"
     if not chunks_path.exists():
         logger.warning("chunks file not found: %s, keyword search disabled", chunks_path)
         return None, []
@@ -156,6 +159,7 @@ def semantic_search(
     has_code: Optional[bool] = None,
 ) -> List[dict]:
     """语义检索，返回最相关的 chunks。"""
+    cfg = _active_config()
     query_vector = embed_query(query)
 
     must_filters = []
@@ -177,7 +181,7 @@ def semantic_search(
     headers = {"api-key": QDRANT_API_KEY} if QDRANT_API_KEY else None
     client = httpx.Client(timeout=30.0, headers=headers)
     resp = client.post(
-        f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{COLLECTION_NAME}/points/search",
+        f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{cfg['collection']}/points/search",
         json=search_body,
     )
     resp.raise_for_status()
@@ -278,18 +282,27 @@ def path_boost(results: List[dict], query: str, boost_per_match: float = 0.8) ->
 
 
 
-def identifier_boost(results: List[dict], query: str, boost_per_match: float = 1.0) -> List[dict]:
-    """Boost exact code/API identifiers from the query in title/path/text head."""
+def identifier_boost(results: List[dict], query: str, boost_per_match: float = 1.0, symbol_weights: Optional[Dict[str, float]] = None) -> List[dict]:
+    """Boost exact code/API identifiers from the query in title/path/text head.
+
+    Args:
+        symbol_weights: optional mapping of lowercase symbol → weight.
+            When a query token matches a key here, its boost_per_match is
+            multiplied by this weight (e.g. 2.0 for known identifiers).
+    """
     import re
     stop = {"http", "https", "request", "error", "code", "arkts", "ios"}
     raw_tokens = re.findall(r"[@A-Za-z_][A-Za-z0-9_@.:-]{2,}", query)
-    tokens = []
+    tokens: list[tuple[str, float]] = []
     for t in raw_tokens:
         token = t.strip(".,;:()[]{}<>`'\"").lower()
         if token in stop:
             continue
         if len(token) >= 6 or "." in token or "@" in token or any(c.isupper() for c in t):
-            tokens.append(token)
+            weight = 1.0
+            if symbol_weights and token in symbol_weights:
+                weight = symbol_weights[token]
+            tokens.append((token, weight))
     if not tokens:
         return results
 
@@ -299,9 +312,12 @@ def identifier_boost(results: List[dict], query: str, boost_per_match: float = 1
             r.get("source_file", ""),
             (r.get("text", "") or "")[:2000],
         ]).lower()
-        match_count = sum(1 for token in tokens if token in haystack)
+        match_count = 0
+        for token, weight in tokens:
+            if token in haystack:
+                match_count += 1
+                r["score"] = float(r.get("score", 0.0)) * (1 + boost_per_match * weight)
         if match_count:
-            r["score"] *= (1 + boost_per_match * match_count)
             r["identifier_matches"] = match_count
 
     results.sort(key=lambda r: r.get("score", 0), reverse=True)
@@ -382,22 +398,33 @@ def _hybrid_search(query, top_k, category, has_code) -> List[dict]:
 
 # ── Rerank ──
 
-def rerank_results(query: str, results: List[dict], top_k: int = 5) -> List[dict]:
+def rerank_results(
+    query: str,
+    results: List[dict],
+    top_k: int = 5,
+    *,
+    api_base: str | None = None,
+    model_name: str | None = None,
+) -> List[dict]:
     """调用 aimodels rerank 接口，对候选文档重排。"""
     if not results:
         return []
+    if api_base is None or model_name is None:
+        cfg = _active_config()
+        api_base = api_base or RERANK_API_BASE
+        model_name = model_name or cfg["rerank_model_name"]
 
     documents = [r["text"] for r in results]
     client = httpx.Client(timeout=120.0)
     resp = client.post(
-        f"{RERANK_API_BASE}/api/v1/rerank",
+        f"{api_base}/api/v1/rerank",
         json={
             "query": query,
             "documents": documents,
             "top_k": min(top_k, len(documents)),
             "return_documents": False,
             # 当前 aimodels rerank endpoint 使用默认模型；这里保留字段，便于后续支持多 rerank 路由。
-            "model": RERANK_MODEL_NAME,
+            "model": model_name,
         },
     )
     resp.raise_for_status()
@@ -411,7 +438,7 @@ def rerank_results(query: str, results: List[dict], top_k: int = 5) -> List[dict
             r = results[idx].copy()
             r["rerank_score"] = float(item["score"])
             r["score"] = float(item["score"])
-            r["rerank_model"] = RERANK_MODEL_NAME
+            r["rerank_model"] = model_name
             reranked.append(r)
     return reranked
 
@@ -457,10 +484,11 @@ def rag_query(
     method: str = "hybrid",
 ) -> dict:
     """RAG 查询：检索 + 构建 prompt。"""
+    cfg = _active_config()
     results = search(question, top_k=top_k, category=category, has_code=has_code, method=method)
     context = format_context(results)
 
-    prompt = f"""你是{PROMPT_ROLE}。基于以下参考文档回答用户问题。
+    prompt = f"""你是{cfg["prompt_role"]}。基于以下参考文档回答用户问题。
 
 参考文档：
 {context}
@@ -489,11 +517,12 @@ if __name__ == "__main__":
     method = sys.argv[3] if len(sys.argv) > 3 else "hybrid"
 
     result = rag_query(question, top_k=top_k, method=method)
+    cfg = _active_config()
 
     print(f"\n问题: {result['question']}")
     print(f"领域: {ACTIVE_DOMAIN}")
-    print(f"Embedding: {EMBEDDING_MODEL_NAME}")
-    print(f"Rerank: {RERANK_MODEL_NAME}")
+    print(f"Embedding: {cfg['embedding_model_name']}")
+    print(f"Rerank: {cfg['rerank_model_name']}")
     print(f"检索方法: {method}")
     print(f"检索到 {len(result['results'])} 个相关文档:\n")
     for i, r in enumerate(result["results"], 1):

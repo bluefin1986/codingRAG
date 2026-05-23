@@ -21,34 +21,39 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from config import ACTIVE_DOMAIN, DOCS_DIR, GUIDES_DIR, REFERENCES_DIR, OUTPUT_DIR, CHUNK_MAX_TOKENS, CHUNK_MIN_TOKENS, CHUNK_OVERLAP_TOKENS
+from config import ACTIVE_DOMAIN, CHUNK_MAX_TOKENS, CHUNK_MIN_TOKENS, CHUNK_OVERLAP_TOKENS, get_domain_config
 from chunker import chunk_directory
 
 
 def main() -> None:
     start_time = time.time()
+    cfg = get_domain_config(ACTIVE_DOMAIN)
+    docs_dir = cfg["docs_dir"]
+    guides_dir = docs_dir / "guides"
+    references_dir = docs_dir / "references"
+    output_dir = cfg["output_dir"]
 
     # ── 1. 输出目录 ──
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    chunks_path = OUTPUT_DIR / "chunks.jsonl"
-    stats_path = OUTPUT_DIR / "stats.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chunks_path = output_dir / "chunks.jsonl"
+    stats_path = output_dir / "stats.json"
 
     # ── 2. 扫描并分块 ──
-    print(f"🧭 domain={ACTIVE_DOMAIN} docs_dir={DOCS_DIR}")
+    print(f"🧭 domain={ACTIVE_DOMAIN} docs_dir={docs_dir}")
     all_chunks = []
     file_count = 0
 
     # 兼容两种布局：
     # - guides/references
     # - 单目录 markdown 平铺
-    if GUIDES_DIR.is_dir() or REFERENCES_DIR.is_dir():
+    if guides_dir.is_dir() or references_dir.is_dir():
         scan_targets = [
-            (GUIDES_DIR, "guides"),
-            (REFERENCES_DIR, "references"),
+            (guides_dir, "guides"),
+            (references_dir, "references"),
         ]
     else:
         scan_targets = [
-            (DOCS_DIR, "docs"),
+            (docs_dir, "docs"),
         ]
 
     for dir_path, category in scan_targets:
@@ -107,7 +112,7 @@ def main() -> None:
 
     stats = {
         "domain": ACTIVE_DOMAIN,
-        "docs_dir": str(DOCS_DIR),
+        "docs_dir": str(docs_dir),
         "total_files": file_count,
         "total_chunks": len(all_chunks),
         "chunks_with_code": code_chunks,

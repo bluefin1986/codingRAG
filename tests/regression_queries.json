@@ -1,0 +1,72 @@
+[
+  {
+    "query": "nginx try_files directive",
+    "domain": "nginx",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "try_files",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "nginx proxy_pass configuration",
+    "domain": "nginx",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "proxy_pass",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "nginx upstream load balancing",
+    "domain": "nginx",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "upstream",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "nginx ssl certificate setup",
+    "domain": "nginx",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "ssl",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "nginx rewrite rules",
+    "domain": "nginx",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "rewrite",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "ArkUI List component usage",
+    "domain": "harmonyos",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "List",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "@ohos.net.http request",
+    "domain": "harmonyos",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "http",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "UIAbility lifecycle",
+    "domain": "harmonyos",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "UIAbility",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "HarmonyOS @State decorator",
+    "domain": "harmonyos",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "@State",
+    "method": "hybrid_rerank"
+  },
+  {
+    "query": "ArkTS @Component custom component",
+    "domain": "harmonyos",
+    "expected_top1_source_file": null,
+    "expected_doc_key": "@Component",
+    "method": "hybrid_rerank"
+  }
+]

@@ -36,17 +36,23 @@ from config import (
     RERANK_API_BASE,
     get_domain_config,
 )
-from config import DOMAIN_REGISTRY  # noqa: E402
 
 from api.engine import DomainQueryEngine  # noqa: E402
-from api.registry import DocumentRegistry, RegistryUnavailable  # noqa: E402
+from api.registry import DocumentRegistry, RegistryUnavailable, domain_cache, query_expansion_cache  # noqa: E402
 from indexer.per_doc_indexer import DocumentDisabled, DocumentNotFound, PerDocumentIndexer  # noqa: E402
 from api.schemas import (  # noqa: E402
     LibraryExportRequest,
     LibraryImportRequest,
+    DomainItem,
+    DomainRequest,
     RagQueryRequest,
     RagQueryResponse,
     RagResultItem,
+    QueryExpansionItem,
+    QueryExpansionRequest,
+    RetrievalTrace,
+    TraceStage,
+    TraceStageEntry,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -107,8 +113,9 @@ def _preload_domains(domains_str: str) -> None:
     if not domains:
         return
     logger.info("Preloading domains: %s", domains)
+    available_domains = {item["domain_key"] for item in domain_cache.list_domains()}
     for domain in domains:
-        if domain not in DOMAIN_REGISTRY:
+        if domain not in available_domains:
             logger.warning("Skipping unknown domain for preload: %s", domain)
             continue
         try:
@@ -121,9 +128,6 @@ def _preload_domains(domains_str: str) -> None:
 @app.on_event("startup")
 def _on_startup() -> None:
     """Pre-warm configured domains if CODING_RAG_PRELOAD_DOMAINS is set."""
-    preload_env = os.getenv("CODING_RAG_PRELOAD_DOMAINS", "").strip()
-    if preload_env:
-        _preload_domains(preload_env)
     try:
         _get_registry().init_schema()
         logger.info("Document registry schema initialized")
@@ -131,6 +135,11 @@ def _on_startup() -> None:
         logger.info("Document registry disabled: CODING_RAG_DATABASE_URL is not configured")
     except Exception:
         logger.exception("Document registry schema initialization failed")
+    domain_cache.load()
+    query_expansion_cache.load()
+    preload_env = os.getenv("CODING_RAG_PRELOAD_DOMAINS", "").strip()
+    if preload_env:
+        _preload_domains(preload_env)
 
 
 # ── Endpoints ──
@@ -140,8 +149,74 @@ def health():
     return {
         "status": "ok",
         "default_domain": ACTIVE_DOMAIN,
-        "available_domains": sorted(DOMAIN_REGISTRY.keys()),
+        "available_domains": [item["domain_key"] for item in domain_cache.list_domains()],
     }
+
+
+@app.get("/api/domains", response_model=list[DomainItem])
+def list_domains():
+    """List all registered domains available to this process."""
+    return domain_cache.list_domains()
+
+
+@app.post("/api/domains/reload")
+def reload_domains():
+    """Force reload domain configuration cache from PostgreSQL."""
+    try:
+        _get_registry().init_schema()
+        domain_cache.refresh()
+        _engines.clear()
+        return {"reloaded": True}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("reload_domains failed")
+        raise HTTPException(status_code=500, detail=f"Failed to reload domains: {e}")
+
+
+@app.get("/api/domains/{domain_key}", response_model=DomainItem)
+def get_domain(domain_key: str):
+    """Get a single registered domain."""
+    normalized = domain_key.strip().lower()
+    item = next((domain for domain in domain_cache.list_domains() if domain["domain_key"] == normalized), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Unknown domain={domain_key!r}")
+    return item
+
+
+@app.post("/api/domains", response_model=DomainItem)
+def create_or_update_domain(req: DomainRequest):
+    """Create or update one persisted domain."""
+    try:
+        _get_registry().init_schema()
+        item = domain_cache.upsert(req.domain_key, req.model_dump(exclude={"domain_key"}))
+        _engines.pop(req.domain_key.strip().lower(), None)
+        return item
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("create_or_update_domain failed for domain=%s", req.domain_key)
+        raise HTTPException(status_code=500, detail=f"Failed to save domain: {e}")
+
+
+@app.delete("/api/domains/{domain_key}")
+def delete_domain(domain_key: str):
+    """Disable one persisted domain."""
+    normalized = domain_key.strip().lower()
+    try:
+        _get_registry().init_schema()
+        domain_cache.delete(normalized)
+        _engines.pop(normalized, None)
+        return {"deleted": True, "domain_key": normalized}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    except Exception as e:
+        logger.exception("delete_domain failed for domain=%s", normalized)
+        raise HTTPException(status_code=500, detail=f"Failed to delete domain: {e}")
 
 
 @app.get("/api/libraries")
@@ -153,6 +228,68 @@ def list_libraries():
     except Exception as e:
         logger.exception("list_libraries failed")
         raise HTTPException(status_code=500, detail=f"Failed to list libraries: {e}")
+
+
+@app.get("/api/query-expansions", response_model=list[QueryExpansionItem])
+def list_query_expansions(domain: Optional[str] = Query(None)):
+    """List persisted query expansions, optionally filtered by domain."""
+    try:
+        _get_registry().init_schema()
+        return query_expansion_cache.list_all(domain)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_query_expansions failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list query expansions: {e}")
+
+
+@app.post("/api/query-expansions", response_model=QueryExpansionItem)
+def create_or_update_query_expansion(req: QueryExpansionRequest):
+    """Create or update one query expansion entry."""
+    try:
+        domain_cache.get_config(req.domain)
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Unknown domain={req.domain!r}")
+    try:
+        _get_registry().init_schema()
+        return query_expansion_cache.upsert(req.domain, req.source_term, req.expanded_terms)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("create_or_update_query_expansion failed")
+        raise HTTPException(status_code=500, detail=f"Failed to save query expansion: {e}")
+
+
+@app.delete("/api/query-expansions/{expansion_id}")
+def delete_query_expansion(expansion_id: str):
+    """Delete one query expansion entry."""
+    try:
+        _get_registry().init_schema()
+        query_expansion_cache.delete(expansion_id)
+        return {"deleted": True, "id": expansion_id}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Query expansion not found")
+    except Exception as e:
+        logger.exception("delete_query_expansion failed for expansion_id=%s", expansion_id)
+        raise HTTPException(status_code=500, detail=f"Failed to delete query expansion: {e}")
+
+
+@app.post("/api/query-expansions/reload")
+def reload_query_expansions():
+    """Force reload the process-wide query expansion cache from PostgreSQL."""
+    try:
+        _get_registry().init_schema()
+        query_expansion_cache.refresh()
+        return {"reloaded": True}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("reload_query_expansions failed")
+        raise HTTPException(status_code=500, detail=f"Failed to reload query expansions: {e}")
 
 
 @app.post("/api/docs/scan")
@@ -414,10 +551,12 @@ def retention_preview(library_id: str, keep: int = Query(2, ge=1, le=100)):
 def rag_query(req: RagQueryRequest):
     """执行 RAG 检索。domain 不填时使用服务端默认领域。"""
     domain = (req.domain or ACTIVE_DOMAIN).strip().lower()
-    if domain not in DOMAIN_REGISTRY:
+    try:
+        domain_cache.get_config(domain)
+    except KeyError:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown domain={domain!r}; available: {sorted(DOMAIN_REGISTRY.keys())}",
+            detail=f"Unknown domain={domain!r}; available: {[item['domain_key'] for item in domain_cache.list_domains()]}",
         )
 
     try:
@@ -432,12 +571,30 @@ def rag_query(req: RagQueryRequest):
             category=req.category,
             has_code=req.hasCode,
             method=req.method,
+            debug=req.debug,
         )
     except Exception as e:
         logger.exception("rag_query failed for domain=%s query=%r", domain, req.query)
         raise HTTPException(status_code=502, detail=f"RAG query failed: {e}")
 
     items = [RagResultItem(**r) for r in result["results"]]
+    trace_obj = None
+    if req.debug and "trace" in result:
+        raw_trace = result["trace"]
+        trace_obj = RetrievalTrace(
+            query=raw_trace.get("query", ""),
+            domain=raw_trace.get("domain", ""),
+            method=raw_trace.get("method", ""),
+            query_symbols=raw_trace.get("query_symbols", []),
+            query_expansion=raw_trace.get("query_expansion", []),
+            expanded_bm25_query=raw_trace.get("expanded_bm25_query", ""),
+            semantic_candidates=_build_trace_stage(raw_trace.get("semantic_candidates")) if raw_trace.get("semantic_candidates") else None,
+            bm25_candidates=_build_trace_stage(raw_trace.get("bm25_candidates")) if raw_trace.get("bm25_candidates") else None,
+            fusion=_build_trace_stage(raw_trace.get("fusion")) if raw_trace.get("fusion") else None,
+            boosts=_build_trace_stage(raw_trace.get("boosts")) if raw_trace.get("boosts") else None,
+            rerank=_build_trace_stage(raw_trace.get("rerank")) if raw_trace.get("rerank") else None,
+            final=_build_trace_stage(raw_trace.get("final")) if raw_trace.get("final") else None,
+        )
     return RagQueryResponse(
         query=req.query,
         domain=domain,
@@ -445,7 +602,26 @@ def rag_query(req: RagQueryRequest):
         method=req.method,
         context=result["context"],
         results=items,
+        trace=trace_obj,
     )
+
+
+def _build_trace_stage(raw: dict) -> TraceStage:
+    """Convert a raw trace stage dict to a TraceStage model."""
+    entries = [
+        TraceStageEntry(
+            rank=e.get("rank", 0),
+            score=e.get("score", 0.0),
+            source_file=e.get("source_file", ""),
+            context=e.get("context", ""),
+            text_len=e.get("text_len", 0),
+            symbol_matches=e.get("symbol_matches"),
+            bm25_rank=e.get("bm25_rank"),
+            bm25_score=e.get("bm25_score"),
+        )
+        for e in raw.get("top", [])
+    ]
+    return TraceStage(count=raw.get("count", 0), top=entries)
 
 
 if __name__ == "__main__":

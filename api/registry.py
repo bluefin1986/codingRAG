@@ -28,7 +28,6 @@ from config import (
     CODING_RAG_SEAWEEDFS_KEY_PREFIX,
     CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
     CODING_RAG_STORAGE_BACKEND,
-    DOMAIN_REGISTRY,
     get_domain_config,
 )
 from api.storage import create_storage
@@ -54,6 +53,296 @@ class RegistryUnavailable(RuntimeError):
     pass
 
 
+class DomainCache:
+    """Process-wide domain configuration cache backed by PostgreSQL."""
+
+    def __init__(self, database_url: str | None = None) -> None:
+        self.database_url = database_url or CODING_RAG_DATABASE_URL
+        self._cache: dict[str, dict[str, Any]] = {}
+        self._rows: dict[str, dict[str, Any]] = {}
+        self._loaded = False
+
+    def _connect(self):
+        if not self.database_url:
+            raise RegistryUnavailable("CODING_RAG_DATABASE_URL is not configured")
+        return psycopg.connect(self.database_url, row_factory=dict_row)
+
+    @staticmethod
+    def _to_config(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "display_name": row["display_name"],
+            "language": row["language"],
+            "docs_dir": Path(row["docs_dir"]).expanduser().resolve() if row.get("docs_dir") else None,
+            "collection": row["collection"],
+            "embedding_model": row["embedding_model"],
+            "embedding_model_name": row["embedding_model_name"],
+            "embedding_dim": row["embedding_dim"],
+            "rerank_model_name": row["rerank_model_name"],
+            "prompt_role": row["prompt_role"],
+            "bm25_enabled": row["bm25_enabled"],
+            "bm25_weight": row["bm25_weight"],
+            "path_boost_per_match": row["path_boost_per_match"],
+            "noise_patterns": list(row.get("noise_patterns") or []),
+            "known_identifiers": list(row.get("known_identifiers") or []),
+        }
+
+    @staticmethod
+    def _serialize(domain_key: str, cfg: dict[str, Any], row: dict[str, Any] | None = None) -> dict[str, Any]:
+        item = {
+            "domain_key": domain_key,
+            "display_name": cfg["display_name"],
+            "language": cfg.get("language", ""),
+            "docs_dir": str(cfg["docs_dir"]) if cfg.get("docs_dir") is not None else None,
+            "collection": cfg["collection"],
+            "embedding_model": cfg.get("embedding_model", "BAAI/bge-m3"),
+            "embedding_model_name": cfg.get("embedding_model_name", "bge-m3"),
+            "embedding_dim": cfg.get("embedding_dim", 1024),
+            "rerank_model_name": cfg.get("rerank_model_name", "bge-reranker-base"),
+            "prompt_role": cfg.get("prompt_role", "技术专家"),
+            "bm25_enabled": cfg.get("bm25_enabled", True),
+            "bm25_weight": cfg.get("bm25_weight", 0.3),
+            "path_boost_per_match": cfg.get("path_boost_per_match", 0.0),
+            "noise_patterns": list(cfg.get("noise_patterns") or []),
+            "known_identifiers": list(cfg.get("known_identifiers") or []),
+            "enabled": True,
+            "created_at": None,
+            "updated_at": None,
+        }
+        if row:
+            item["enabled"] = bool(row.get("enabled", True))
+            for field in ("created_at", "updated_at"):
+                if row.get(field) is not None:
+                    item[field] = str(row[field])
+        return item
+
+    def load(self) -> None:
+        """Load persisted enabled domains into the process cache."""
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT * FROM domains ORDER BY domain_key")
+                rows = list(cur.fetchall())
+        except (RegistryUnavailable, psycopg.Error) as exc:
+            logger.warning("Unable to load domains from PostgreSQL: %s", exc)
+
+        self._rows = {row["domain_key"]: row for row in rows}
+        self._cache = {row["domain_key"]: self._to_config(row) for row in rows if row["enabled"]}
+        self._loaded = True
+        if not self._cache:
+            logger.warning("Domain cache is empty after PostgreSQL load")
+
+    def get_config(self, domain_key: str) -> dict[str, Any]:
+        """Get one enabled PostgreSQL-backed domain configuration."""
+        if not self._loaded:
+            self.load()
+        normalized = domain_key.strip().lower()
+        if normalized in self._cache:
+            return dict(self._cache[normalized])
+        raise KeyError(f"Unknown domain: {normalized}")
+
+    def list_domains(self) -> list[dict[str, Any]]:
+        """List enabled PostgreSQL-backed domains."""
+        if not self._loaded:
+            self.load()
+        domains = {
+            key: self._serialize(key, cfg, self._rows.get(key))
+            for key, cfg in self._cache.items()
+        }
+        return [domains[key] for key in sorted(domains)]
+
+    def refresh(self) -> None:
+        """Force reload from PostgreSQL."""
+        self.load()
+
+    def upsert(self, domain_key: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Create or update a domain in PostgreSQL and refresh the process cache."""
+        normalized = domain_key.strip().lower()
+        if not normalized:
+            raise ValueError("domain_key is required")
+        docs_dir = config.get("docs_dir")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO domains (
+                    domain_key, display_name, language, docs_dir, collection,
+                    embedding_model, embedding_model_name, embedding_dim,
+                    rerank_model_name, prompt_role, bm25_enabled, bm25_weight,
+                    path_boost_per_match, noise_patterns, known_identifiers, enabled
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                ON CONFLICT (domain_key) DO UPDATE SET
+                  display_name = EXCLUDED.display_name,
+                  language = EXCLUDED.language,
+                  docs_dir = EXCLUDED.docs_dir,
+                  collection = EXCLUDED.collection,
+                  embedding_model = EXCLUDED.embedding_model,
+                  embedding_model_name = EXCLUDED.embedding_model_name,
+                  embedding_dim = EXCLUDED.embedding_dim,
+                  rerank_model_name = EXCLUDED.rerank_model_name,
+                  prompt_role = EXCLUDED.prompt_role,
+                  bm25_enabled = EXCLUDED.bm25_enabled,
+                  bm25_weight = EXCLUDED.bm25_weight,
+                  path_boost_per_match = EXCLUDED.path_boost_per_match,
+                  noise_patterns = EXCLUDED.noise_patterns,
+                  known_identifiers = EXCLUDED.known_identifiers,
+                  enabled = TRUE,
+                  updated_at = now()
+                RETURNING *
+                """,
+                [
+                    normalized,
+                    config["display_name"],
+                    config.get("language", ""),
+                    str(docs_dir) if docs_dir is not None else None,
+                    config["collection"],
+                    config.get("embedding_model", "BAAI/bge-m3"),
+                    config.get("embedding_model_name", "bge-m3"),
+                    config.get("embedding_dim", 1024),
+                    config.get("rerank_model_name", "bge-reranker-base"),
+                    config.get("prompt_role", "技术专家"),
+                    config.get("bm25_enabled", True),
+                    config.get("bm25_weight", 0.3),
+                    config.get("path_boost_per_match", 0.0),
+                    Jsonb(config.get("noise_patterns", [])),
+                    Jsonb(config.get("known_identifiers", [])),
+                ],
+            )
+            row = cur.fetchone()
+            conn.commit()
+        self.load()
+        return self._serialize(normalized, self._to_config(row), row)
+
+    def delete(self, domain_key: str) -> None:
+        """Soft-delete one persisted domain."""
+        normalized = domain_key.strip().lower()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE domains SET enabled = FALSE, updated_at = now() WHERE domain_key = %s AND enabled RETURNING domain_key",
+                [normalized],
+            )
+            if cur.fetchone() is None:
+                raise KeyError(normalized)
+            conn.commit()
+        self.load()
+
+
+domain_cache = DomainCache()
+
+
+class QueryExpansionCache:
+    """Process-wide query expansion cache backed by PostgreSQL."""
+
+    def __init__(self, database_url: str | None = None) -> None:
+        self.database_url = database_url or CODING_RAG_DATABASE_URL
+        self._cache: dict[str, dict[str, list[str]]] = {}
+        self._loaded = False
+
+    def _connect(self):
+        if not self.database_url:
+            raise RegistryUnavailable("CODING_RAG_DATABASE_URL is not configured")
+        return psycopg.connect(self.database_url, row_factory=dict_row)
+
+    @staticmethod
+    def _serialize(row: dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        for field in ("id", "created_at", "updated_at"):
+            if item.get(field) is not None:
+                item[field] = str(item[field])
+        item["expanded_terms"] = list(item.get("expanded_terms") or [])
+        return item
+
+    def load(self) -> None:
+        """Load all enabled PostgreSQL entries into the process cache."""
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT domain, source_term, expanded_terms
+                    FROM query_expansions
+                    WHERE enabled
+                    ORDER BY domain, source_term
+                    """
+                )
+                rows = list(cur.fetchall())
+        except (RegistryUnavailable, psycopg.Error) as exc:
+            logger.warning("Unable to load query expansions from PostgreSQL: %s", exc)
+
+        database_cache: dict[str, dict[str, list[str]]] = {}
+        for row in rows:
+            database_cache.setdefault(row["domain"], {})[row["source_term"]] = list(row["expanded_terms"])
+
+        self._cache = database_cache
+        self._loaded = True
+
+    def get_expansions(self, domain: str) -> dict[str, list[str]]:
+        """Get persisted query expansion entries for one domain."""
+        if not self._loaded:
+            self.load()
+        normalized = domain.strip().lower()
+        return self._cache.get(normalized, {})
+
+    def refresh(self) -> None:
+        """Force reload from PostgreSQL."""
+        self.load()
+
+    def upsert(self, domain: str, source_term: str, expanded_terms: list[str]) -> dict[str, Any]:
+        """Create or update a query expansion and publish refreshed cache content."""
+        domain = domain.strip().lower()
+        source_term = source_term.strip()
+        terms = [term.strip() for term in expanded_terms if term.strip()]
+        if not domain or not source_term or not terms:
+            raise ValueError("domain, source_term, and expanded_terms are required")
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO query_expansions (domain, source_term, expanded_terms)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (domain, source_term) DO UPDATE SET
+                  expanded_terms = EXCLUDED.expanded_terms,
+                  enabled = TRUE,
+                  updated_at = now()
+                RETURNING *
+                """,
+                [domain, source_term, terms],
+            )
+            row = cur.fetchone()
+            conn.commit()
+        self.load()
+        return self._serialize(row)
+
+    def delete(self, expansion_id: str) -> None:
+        """Delete one query expansion and publish refreshed cache content."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM query_expansions WHERE id = %s RETURNING id", [expansion_id])
+            if cur.fetchone() is None:
+                raise KeyError(expansion_id)
+            conn.commit()
+        self.load()
+
+    def list_all(self, domain: str | None = None) -> list[dict[str, Any]]:
+        """List persisted query expansions, optionally filtered by domain."""
+        params: list[str] = []
+        where = ""
+        if domain:
+            where = "WHERE domain = %s"
+            params.append(domain.strip().lower())
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, domain, source_term, expanded_terms, enabled, created_at, updated_at
+                FROM query_expansions
+                {where}
+                ORDER BY domain, source_term
+                """,
+                params,
+            )
+            return [self._serialize(row) for row in cur.fetchall()]
+
+
+query_expansion_cache = QueryExpansionCache()
+
+
 class DocumentRegistry:
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or CODING_RAG_DATABASE_URL
@@ -67,7 +356,16 @@ class DocumentRegistry:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
-                cur.execute(MIGRATION_SQL)
+                self._apply_migrations(cur)
+        if not domain_cache._loaded:
+            domain_cache.load()
+        if not query_expansion_cache._loaded:
+            query_expansion_cache.load()
+
+    def _apply_migrations(self, cur) -> None:
+        cur.execute(MIGRATION_SQL)
+        cur.execute(DOMAIN_SCHEMA_SQL)
+        cur.execute(QUERY_EXPANSION_SCHEMA_SQL)
 
     def list_libraries(self) -> list[dict[str, Any]]:
         self.init_schema()
@@ -87,11 +385,13 @@ class DocumentRegistry:
 
     def scan_domain(self, domain: str, *, limit: int | None = None) -> ScanResult:
         domain = domain.strip().lower()
-        if domain not in DOMAIN_REGISTRY:
-            raise ValueError(f"Unknown domain={domain!r}; available: {sorted(DOMAIN_REGISTRY)}")
         self.init_schema()
-
-        cfg = get_domain_config(domain)
+        try:
+            cfg = get_domain_config(domain)
+        except KeyError:
+            raise ValueError(f"Unknown domain={domain!r}") from None
+        if cfg.get("docs_dir") is None:
+            raise ValueError(f"docs_dir is not configured for domain={domain!r}")
         docs_dir = Path(cfg["docs_dir"]).expanduser().resolve()
         if not docs_dir.exists():
             raise FileNotFoundError(f"docs_dir does not exist for domain={domain}: {docs_dir}")
@@ -1567,4 +1867,43 @@ BEGIN
       CHECK (storage_backend IN ('local', 'seaweedfs', 's3', 'minio', 'fastdfs'));
   END IF;
 END $$;
+"""
+
+DOMAIN_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS domains (
+    domain_key TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT '',
+    docs_dir TEXT,
+    collection TEXT NOT NULL,
+    embedding_model TEXT NOT NULL DEFAULT 'BAAI/bge-m3',
+    embedding_model_name TEXT NOT NULL DEFAULT 'bge-m3',
+    embedding_dim INT NOT NULL DEFAULT 1024,
+    rerank_model_name TEXT NOT NULL DEFAULT 'bge-reranker-base',
+    prompt_role TEXT NOT NULL DEFAULT '技术专家',
+    bm25_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    bm25_weight FLOAT NOT NULL DEFAULT 0.3,
+    path_boost_per_match FLOAT NOT NULL DEFAULT 0.0,
+    noise_patterns JSONB NOT NULL DEFAULT '[]',
+    known_identifiers JSONB NOT NULL DEFAULT '[]',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_domains_enabled ON domains(domain_key) WHERE enabled;
+"""
+
+QUERY_EXPANSION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS query_expansions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain TEXT NOT NULL,
+    source_term TEXT NOT NULL,
+    expanded_terms TEXT[] NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(domain, source_term)
+);
+CREATE INDEX IF NOT EXISTS idx_query_expansions_domain ON query_expansions(domain) WHERE enabled;
 """

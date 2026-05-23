@@ -59,7 +59,7 @@ def check_qdrant_collection(host: str, port: int, collection: str) -> tuple[bool
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate codingRAG retrieval quality")
-    parser.add_argument("--domain", default="ios", help="Domain from config.DOMAIN_REGISTRY, e.g. ios/harmonyos")
+    parser.add_argument("--domain", default="ios", help="Seeded database domain, e.g. ios/harmonyos")
     parser.add_argument("--query", "-q", default="Objective-C 怎么创建 UIButton 并响应点击事件", help="Query text")
     parser.add_argument("--method", choices=["hybrid", "rerank", "hybrid_rerank", "semantic", "bm25"], default="hybrid")
     parser.add_argument("--top-k", type=int, default=5)
@@ -77,21 +77,23 @@ def main() -> int:
 
     import config
     from indexer.retriever import rag_query
+    cfg = config.get_domain_config(config.ACTIVE_DOMAIN)
+    chunks_file = cfg["output_dir"] / "chunks.jsonl"
 
     print("=" * 88)
     print("codingRAG smoke test")
     print("=" * 88)
     print(f"domain:      {config.ACTIVE_DOMAIN}")
-    print(f"docs_dir:    {config.DOCS_DIR}")
-    print(f"chunks:      {config.CHUNKS_FILE} exists={config.CHUNKS_FILE.exists()}")
-    print(f"collection:  {config.COLLECTION_NAME}")
-    print(f"embedding:   {config.EMBEDDING_MODEL_NAME} ({config.EMBEDDING_DIM}d)")
-    print(f"rerank:      {config.RERANK_MODEL_NAME}")
+    print(f"docs_dir:    {cfg['docs_dir']}")
+    print(f"chunks:      {chunks_file} exists={chunks_file.exists()}")
+    print(f"collection:  {cfg['collection']}")
+    print(f"embedding:   {cfg['embedding_model_name']} ({cfg['embedding_dim']}d)")
+    print(f"rerank:      {cfg['rerank_model_name']}")
     print(f"method:      {args.method}")
     print(f"query:       {args.query}")
 
     aimodels_ok = check_http(f"{config.AIMODELS_API_BASE}/")
-    qdrant_ok, qdrant_info = check_qdrant_collection(config.QDRANT_HOST, config.QDRANT_PORT, config.COLLECTION_NAME)
+    qdrant_ok, qdrant_info = check_qdrant_collection(config.QDRANT_HOST, config.QDRANT_PORT, cfg["collection"])
     print(f"aimodels:    {'OK' if aimodels_ok else 'FAIL'} {config.AIMODELS_API_BASE}")
     print(f"qdrant:      {'OK' if qdrant_ok else 'FAIL'} {qdrant_info}")
     print("-" * 88)

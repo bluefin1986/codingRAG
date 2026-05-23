@@ -106,7 +106,7 @@ def print_results(title: str, results: List[Any], other_keys: set[Tuple[str, int
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare local BM25 and OpenSearch text-only BM25 results")
-    parser.add_argument("--domain", default="harmonyos", help="Domain from config.DOMAIN_REGISTRY")
+    parser.add_argument("--domain", default="harmonyos", help="Seeded database domain")
     parser.add_argument("--query", "-q", required=True, help="Query to compare")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--chunks", type=Path, default=None, help="Override chunks.jsonl path")
@@ -134,7 +134,7 @@ def main() -> int:
     from indexer.es_searcher import ESSearcher
     from indexer.local_bm25_searcher import LocalBM25Searcher
 
-    chunks_path = args.chunks or config.CHUNKS_FILE
+    chunks_path = args.chunks or config.get_domain_config(config.ACTIVE_DOMAIN)["output_dir"] / "chunks.jsonl"
     if not chunks_path.exists():
         print(f"chunks file not found: {chunks_path}", file=sys.stderr)
         return 2

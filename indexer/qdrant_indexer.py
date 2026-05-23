@@ -20,31 +20,26 @@ from tqdm import tqdm
 
 from config import (
     ACTIVE_DOMAIN,
-    CHUNKS_FILE,
-    COLLECTION_NAME,
-    DOMAIN_REGISTRY,
     EMBEDDING_API_BASE,
-    EMBEDDING_DIM,
-    EMBEDDING_MODEL_NAME,
-    NOISE_PATTERNS as NOISE_PATTERN_STRINGS,
-    OUTPUT_DIR,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_API_KEY,
-    RERANK_MODEL_NAME,
+    get_domain_config,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── 噪声清洗 ──
-NOISE_PATTERNS = [re.compile(pattern) for pattern in NOISE_PATTERN_STRINGS]
+
+def _active_config() -> dict:
+    """Resolve legacy single-domain configuration only when indexing runs."""
+    return get_domain_config(ACTIVE_DOMAIN)
 
 
 def clean_text(text: str, noise_pattern_strings: Optional[List[str]] = None) -> str:
     """清洗文档噪声。"""
-    patterns = NOISE_PATTERNS
-    if noise_pattern_strings is not None:
-        patterns = [re.compile(pattern) for pattern in noise_pattern_strings]
+    if noise_pattern_strings is None:
+        noise_pattern_strings = _active_config().get("noise_patterns", [])
+    patterns = [re.compile(pattern) for pattern in noise_pattern_strings]
     for pat in patterns:
         text = pat.sub("", text)
     # 合并连续空行
@@ -69,6 +64,8 @@ def embed_texts(
     model_name: str | None = None,
 ) -> List[List[float]]:
     """调用 aimodels 服务批量生成 embedding，带重试和进度显示。"""
+    if model_name is None:
+        model_name = _active_config()["embedding_model_name"]
     import time as _time
     all_embeddings: List[List[float]] = []
     client = httpx.Client(timeout=900.0)
@@ -88,7 +85,7 @@ def embed_texts(
             try:
                 resp = client.post(
                     f"{api_base or EMBEDDING_API_BASE}/api/v1/embeddings",
-                    json={"input": batch, "model": model_name or EMBEDDING_MODEL_NAME},
+                    json={"input": batch, "model": model_name},
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -116,16 +113,18 @@ def embed_texts(
 # ── Qdrant ──
 def ensure_collection(client: httpx.Client, recreate: bool = False) -> None:
     """确保 Qdrant collection 存在。"""
-    url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{COLLECTION_NAME}"
+    cfg = _active_config()
+    collection = cfg["collection"]
+    url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{collection}"
 
     if recreate:
         client.delete(url)
-        logger.info("deleted existing collection: %s", COLLECTION_NAME)
+        logger.info("deleted existing collection: %s", collection)
 
     # 检查是否存在
     resp = client.get(url)
     if resp.status_code == 200:
-        logger.info("collection already exists: %s", COLLECTION_NAME)
+        logger.info("collection already exists: %s", collection)
         return
 
     # 创建
@@ -133,7 +132,7 @@ def ensure_collection(client: httpx.Client, recreate: bool = False) -> None:
         url,
         json={
             "vectors": {
-                "size": EMBEDDING_DIM,
+                "size": cfg["embedding_dim"],
                 "distance": "Cosine",
             },
             "optimizers_config": {
@@ -142,7 +141,7 @@ def ensure_collection(client: httpx.Client, recreate: bool = False) -> None:
         },
     )
     create_resp.raise_for_status()
-    logger.info("created collection: %s (dim=%d)", COLLECTION_NAME, EMBEDDING_DIM)
+    logger.info("created collection: %s (dim=%d)", collection, cfg["embedding_dim"])
 
 
 def upsert_points(
@@ -151,7 +150,8 @@ def upsert_points(
     batch_size: int = 100,
 ) -> int:
     """批量写入 points 到 Qdrant。"""
-    url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{COLLECTION_NAME}/points"
+    collection = _active_config()["collection"]
+    url = f"http://{QDRANT_HOST}:{QDRANT_PORT}/collections/{collection}/points"
     total_written = 0
 
     total_batches = (len(points) + batch_size - 1) // batch_size
@@ -217,7 +217,8 @@ def run_indexing(
     qdrant_batch_size: int = 100,
 ) -> dict:
     """完整流程：加载 → 清洗 → embedding → 写入 Qdrant。"""
-    filepath = chunks_file or CHUNKS_FILE
+    cfg = _active_config()
+    filepath = chunks_file or cfg["output_dir"] / "chunks.jsonl"
     if not filepath.exists():
         raise FileNotFoundError(f"chunks file not found: {filepath}")
 
@@ -274,13 +275,13 @@ def run_indexing(
         "embed_time_seconds": round(embed_time, 1),
         "upsert_time_seconds": round(upsert_time, 1),
         "domain": ACTIVE_DOMAIN,
-        "collection": COLLECTION_NAME,
-        "embedding_dim": EMBEDDING_DIM,
-        "embedding_model": EMBEDDING_MODEL_NAME,
-        "rerank_model": RERANK_MODEL_NAME,
+        "collection": cfg["collection"],
+        "embedding_dim": cfg["embedding_dim"],
+        "embedding_model": cfg["embedding_model_name"],
+        "rerank_model": cfg["rerank_model_name"],
     }
 
-    stats_path = OUTPUT_DIR / "index_stats.json"
+    stats_path = cfg["output_dir"] / "index_stats.json"
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     logger.info("stats saved to %s", stats_path)
@@ -294,7 +295,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(description="Embed chunks and index into Qdrant")
-    parser.add_argument("--domain", choices=sorted(DOMAIN_REGISTRY), default=ACTIVE_DOMAIN, help="Domain/language index to build")
+    parser.add_argument("--domain", default=ACTIVE_DOMAIN, help="Domain/language index to build")
     parser.add_argument("--recreate", action="store_true", help="Recreate the selected domain's Qdrant collection")
     parser.add_argument("--batch-size", type=int, default=32, help="Embedding batch size")
     parser.add_argument("--qdrant-batch", type=int, default=100, help="Qdrant upsert batch size")
@@ -305,13 +306,14 @@ if __name__ == "__main__":
         env["CODING_RAG_DOMAIN"] = args.domain
         os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
+    cfg = _active_config()
     logging.info(
         "indexing domain=%s collection=%s embedding=%s rerank=%s chunks=%s",
         ACTIVE_DOMAIN,
-        COLLECTION_NAME,
-        EMBEDDING_MODEL_NAME,
-        RERANK_MODEL_NAME,
-        CHUNKS_FILE,
+        cfg["collection"],
+        cfg["embedding_model_name"],
+        cfg["rerank_model_name"],
+        cfg["output_dir"] / "chunks.jsonl",
     )
 
     stats = run_indexing(

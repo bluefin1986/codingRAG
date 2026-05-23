@@ -41,117 +41,29 @@ CODING_RAG_IMPORT_BATCH_SIZE = int(os.getenv("CODING_RAG_IMPORT_BATCH_SIZE", "10
 CODING_RAG_ES_URL = os.getenv("CODING_RAG_ES_URL", "").strip().rstrip("/")
 CODING_RAG_ES_API_KEY = os.getenv("CODING_RAG_ES_API_KEY", "").strip()
 
-# ── 领域/语言注册表 ──
-# 新增语言/技术栈时，只需要在这里加一个 entry。
-DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "harmonyos": {
-        "display_name": "HarmonyOS / ArkTS",
-        "language": "ArkTS",
-        "docs_dir": PROJECT_ROOT.parent / "harmonyos-docs-fetcher" / "harmonyos-docs-full",
-        "collection": "harmonyos_docs",
-        "embedding_model": "BAAI/bge-large-zh-v1.5",
-        "embedding_model_name": "bge-large-zh-v1.5",
-        "embedding_dim": 1024,
-        "rerank_model_name": "bge-reranker-base",
-        "prompt_role": "鸿蒙开发专家",
-        # HarmonyOS docs currently have ~90k chunks; loading a full in-memory BM25
-        # index is expensive and has caused the API worker to be killed. Keep
-        # semantic/rerank online first; re-enable BM25 after index optimization.
-        "bm25_enabled": True,
-        "bm25_weight": 0.7,
-        "path_boost_per_match": 0.0,
-        "noise_patterns": [
-            r"收起自动换行深色代码主题复制\s*",
-            r"\[外链图片[^\]]*\]",
-            r"!\[image\]\([^\)]*\)",
-            r"https://alliance-communityfile[^\s]*",
-            r"https://developer\.huawei\.com/consumer/cn/doc/[^\s\)]*",
-        ],
-    },
-    "ios": {
-        "display_name": "iOS / UIKit / Objective-C",
-        "language": "Objective-C",
-        "docs_dir": PROJECT_ROOT.parent / "ios-docs" / "uikit",
-        "collection": "ios_docs",
-        "embedding_model": "BAAI/bge-m3",
-        "embedding_model_name": "bge-m3",
-        "embedding_dim": 1024,
-        "rerank_model_name": "bge-reranker-base",
-        "prompt_role": "iOS UIKit / Objective-C 开发专家",
-        "bm25_enabled": True,
-        "bm25_weight": 0.1,
-        "path_boost_per_match": 0.0,
-        "noise_patterns": [
-            r'title: "This page requires JavaScript\."\n',
-            r"(?m)^- \[Documentation\]\([^\)]*\)\s*$",
-        ],
-    },
-    "redis62": {
-        "display_name": "Redis 6.2",
-        "language": "Redis",
-        "docs_dir": PROJECT_ROOT.parent / "redis-docs-md" / "redis62",
-        "collection": "redis62_docs",
-        "embedding_model": "BAAI/bge-m3",
-        "embedding_model_name": "bge-m3",
-        "embedding_dim": 1024,
-        "rerank_model_name": "bge-reranker-base",
-        "prompt_role": "Redis 6.2 技术专家",
-        "bm25_enabled": True,
-        "bm25_weight": 0.3,
-        "path_boost_per_match": 0.2,
-        "noise_patterns": [],
-    },
-    "kafka28": {
-        "display_name": "Apache Kafka 2.8",
-        "language": "Kafka",
-        "docs_dir": PROJECT_ROOT.parent / "kafka-docs-md" / "kafka28",
-        "collection": "kafka28_docs",
-        "embedding_model": "BAAI/bge-m3",
-        "embedding_model_name": "bge-m3",
-        "embedding_dim": 1024,
-        "rerank_model_name": "bge-reranker-base",
-        "prompt_role": "Apache Kafka 2.8 技术专家",
-        "bm25_enabled": True,
-        "bm25_weight": 0.3,
-        "path_boost_per_match": 0.2,
-        "noise_patterns": [],
-    },
-    "nginx": {
-        "display_name": "NGINX official docs",
-        "language": "NGINX",
-        "docs_dir": PROJECT_ROOT.parent / "nginx-docs-md" / "nginx",
-        "collection": "nginx_docs",
-        "embedding_model": "BAAI/bge-m3",
-        "embedding_model_name": "bge-m3",
-        "embedding_dim": 1024,
-        "rerank_model_name": "bge-reranker-base",
-        "prompt_role": "NGINX 配置与模块专家",
-        "bm25_enabled": True,
-        "bm25_weight": 0.3,
-        "path_boost_per_match": 0.2,
-        "noise_patterns": [],
-    },
-}
+# ── BM25 内存安全阈值 ──
+# 当 chunk 数量超过此阈值时，仅索引前 N 条以避免 OOM。
+# HarmonyOS 约 90k chunks，全量加载会导致 API worker 被 OOM killer 终止。
+BM25_MAX_CHUNKS = int(os.getenv("CODING_RAG_BM25_MAX_CHUNKS", "50000"))
 
 DEFAULT_DOMAIN = "ios"
 ACTIVE_DOMAIN = os.getenv("CODING_RAG_DOMAIN", DEFAULT_DOMAIN).strip().lower()
-if ACTIVE_DOMAIN not in DOMAIN_REGISTRY:
-    known = ", ".join(sorted(DOMAIN_REGISTRY))
-    raise ValueError(f"Unknown CODING_RAG_DOMAIN={ACTIVE_DOMAIN!r}; known domains: {known}")
 
 
 def get_domain_config(domain: str | None = None) -> Dict[str, Any]:
-    """返回指定领域配置，环境变量可覆盖常用字段。"""
+    """Return one PostgreSQL-backed domain config with environment overrides."""
     name = (domain or ACTIVE_DOMAIN).strip().lower()
-    if name not in DOMAIN_REGISTRY:
-        known = ", ".join(sorted(DOMAIN_REGISTRY))
-        raise ValueError(f"Unknown domain={name!r}; known domains: {known}")
+    from api.registry import domain_cache
 
-    cfg = dict(DOMAIN_REGISTRY[name])
+    cfg = domain_cache.get_config(name)
     prefix = f"CODING_RAG_{name.upper()}_"
 
     cfg["domain"] = name
-    cfg["docs_dir"] = _path(os.getenv(prefix + "DOCS_DIR", os.getenv("CODING_RAG_DOCS_DIR", str(cfg["docs_dir"]))))
+    docs_dir_override = os.getenv(prefix + "DOCS_DIR", os.getenv("CODING_RAG_DOCS_DIR", "")).strip()
+    if docs_dir_override:
+        cfg["docs_dir"] = _path(docs_dir_override)
+    elif cfg.get("docs_dir") is not None:
+        cfg["docs_dir"] = _path(cfg["docs_dir"])
     cfg["collection"] = os.getenv(prefix + "COLLECTION", os.getenv("CODING_RAG_COLLECTION_NAME", cfg["collection"]))
     cfg["embedding_model_name"] = os.getenv(prefix + "EMBEDDING_MODEL_NAME", cfg["embedding_model_name"])
     cfg["embedding_model"] = os.getenv(prefix + "EMBEDDING_MODEL", cfg["embedding_model"])
@@ -165,23 +77,6 @@ def get_domain_config(domain: str | None = None) -> Dict[str, Any]:
     cfg["output_dir"] = _path(os.getenv(prefix + "OUTPUT_DIR", os.getenv("CODING_RAG_OUTPUT_DIR", str(PROJECT_ROOT / "output" / name))))
     return cfg
 
-
-ACTIVE_DOMAIN_CONFIG = get_domain_config()
-
-# ── 当前活动领域的兼容导出 ──
-DOCS_DIR = ACTIVE_DOMAIN_CONFIG["docs_dir"]
-GUIDES_DIR = DOCS_DIR / "guides"
-REFERENCES_DIR = DOCS_DIR / "references"
-OUTPUT_DIR = ACTIVE_DOMAIN_CONFIG["output_dir"]
-CHUNKS_FILE = OUTPUT_DIR / "chunks.jsonl"
-
-COLLECTION_NAME = ACTIVE_DOMAIN_CONFIG["collection"]
-EMBEDDING_MODEL = ACTIVE_DOMAIN_CONFIG["embedding_model"]
-EMBEDDING_MODEL_NAME = ACTIVE_DOMAIN_CONFIG["embedding_model_name"]
-EMBEDDING_DIM = ACTIVE_DOMAIN_CONFIG["embedding_dim"]
-RERANK_MODEL_NAME = ACTIVE_DOMAIN_CONFIG["rerank_model_name"]
-PROMPT_ROLE = ACTIVE_DOMAIN_CONFIG["prompt_role"]
-NOISE_PATTERNS = ACTIVE_DOMAIN_CONFIG.get("noise_patterns", [])
 
 # ── Chunking ──
 CHUNK_MAX_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MAX_TOKENS", "800"))

@@ -1,0 +1,137 @@
+"""Static domain seed data for deployment scripts only."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DOMAIN_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "harmonyos": {
+        "display_name": "HarmonyOS / ArkTS",
+        "language": "ArkTS",
+        "docs_dir": PROJECT_ROOT.parent / "harmonyos-docs-fetcher" / "harmonyos-docs-full",
+        "collection": "harmonyos_docs",
+        "embedding_model": "BAAI/bge-large-zh-v1.5",
+        "embedding_model_name": "bge-large-zh-v1.5",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "鸿蒙开发专家",
+        # HarmonyOS docs currently have ~90k chunks; loading a full in-memory BM25
+        # index is expensive and has caused the API worker to be killed. Keep
+        # semantic/rerank online first; re-enable BM25 after index optimization.
+        "bm25_enabled": True,
+        "bm25_weight": 0.7,
+        "path_boost_per_match": 0.0,
+        "noise_patterns": [
+            r"收起自动换行深色代码主题复制\s*",
+            r"\[外链图片[^\]]*\]",
+            r"!\[image\]\([^\)]*\)",
+            r"https://alliance-communityfile[^\s]*",
+            r"https://developer\.huawei\.com/consumer/cn/doc/[^\s\)]*",
+        ],
+        # ── Phase 4: query expansion & known identifiers ──
+        "query_expansions": {
+            "ArkUI": "ArkTS @Component UIAbility @Entry @Builder",
+            "ArkTS": "@Component @Entry @State @Prop @Link @Builder ArkUI",
+            "UIAbility": "AbilityStage @Entry want launchType",
+            "@State": "@Prop @Link @Watch @ObservedV2 ArkUI state",
+            "@Component": "@Entry @Builder custom component ArkUI",
+            "List": "ListItem LazyForEach WaterMargin",
+            "@ohos": "@ohos.net.http @ohos.data @ohos.file @ohos.router OpenHarmony",
+            "Navigation": "NavDestination NavRouter NavigationStack",
+        },
+        "known_identifiers": [
+            "@Entry", "@Component", "@State", "@Prop", "@Link", "@Watch",
+            "@Builder", "@ObservedV2", "@Trace", "@Local", "@Param",
+            "@Concurrent", "@Require",
+            "List", "ListItem", "Column", "Row", "Stack", "Grid",
+            "TextInput", "Button", "Image", "Text", "Slider", "Toggle",
+            "@ohos.net.http", "@ohos.data", "@ohos.file", "@ohos.router",
+            "UIAbility", "AbilityStage", "Context",
+            "Navigation", "NavDestination", "NavRouter",
+        ],
+    },
+    "ios": {
+        "display_name": "iOS / UIKit / Objective-C",
+        "language": "Objective-C",
+        "docs_dir": PROJECT_ROOT.parent / "ios-docs" / "uikit",
+        "collection": "ios_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "iOS UIKit / Objective-C 开发专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.1,
+        "path_boost_per_match": 0.0,
+        "noise_patterns": [
+            r'title: "This page requires JavaScript\."\n',
+            r"(?m)^- \[Documentation\]\([^\)]*\)\s*$",
+        ],
+        # ── Phase 4: query expansion & known identifiers ──
+        "query_expansions": {
+            "SwiftUI": "View @State @Binding @StateObject @ObservedObject",
+            "UIKit": "UIView UIViewController UIResponder",
+            "@State": "@Binding @StateObject @ObservedObject @Published SwiftUI",
+            "View": "ViewModifier some View SwiftUI body",
+            "NavigationStack": "NavigationLink NavigationSplitView",
+            "List": "ForEach Identifiable SwiftUI",
+        },
+        "known_identifiers": [
+            "View", "ViewModifier", "App", "Scene",
+            "@State", "@Binding", "@StateObject", "@ObservedObject",
+            "@Published", "@EnvironmentObject", "@Environment", "@AppStorage",
+            "ObservableObject", "Identifiable",
+            "NavigationStack", "NavigationLink", "NavigationSplitView",
+            "List", "Form", "TextField", "Text", "Image", "Button",
+            "UIView", "UIViewController", "UIResponder",
+            "UIApplicationDelegate", "UIButton", "UILabel",
+        ],
+    },
+    "redis62": {
+        "display_name": "Redis 6.2",
+        "language": "Redis",
+        "docs_dir": PROJECT_ROOT.parent / "redis-docs-md" / "redis62",
+        "collection": "redis62_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "Redis 6.2 技术专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
+    },
+    "kafka28": {
+        "display_name": "Apache Kafka 2.8",
+        "language": "Kafka",
+        "docs_dir": PROJECT_ROOT.parent / "kafka-docs-md" / "kafka28",
+        "collection": "kafka28_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "Apache Kafka 2.8 技术专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
+    },
+    "nginx": {
+        "display_name": "NGINX official docs",
+        "language": "NGINX",
+        "docs_dir": PROJECT_ROOT.parent / "nginx-docs-md" / "nginx",
+        "collection": "nginx_docs",
+        "embedding_model": "BAAI/bge-m3",
+        "embedding_model_name": "bge-m3",
+        "embedding_dim": 1024,
+        "rerank_model_name": "bge-reranker-base",
+        "prompt_role": "NGINX 配置与模块专家",
+        "bm25_enabled": True,
+        "bm25_weight": 0.3,
+        "path_boost_per_match": 0.2,
+        "noise_patterns": [],
+    },
+}

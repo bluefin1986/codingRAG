@@ -37,7 +37,6 @@ from config import (
     CODING_RAG_SEAWEEDFS_FILER_URL,
     CODING_RAG_SEAWEEDFS_KEY_PREFIX,
     CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
-    DOMAIN_REGISTRY,
     EMBEDDING_API_BASE,
     QDRANT_API_KEY,
     QDRANT_HOST,
@@ -377,8 +376,10 @@ class PerDocumentIndexer:
 
     def reindex_changed(self, domain: str) -> dict[str, Any]:
         normalized = domain.strip().lower()
-        if normalized not in DOMAIN_REGISTRY:
-            raise ValueError(f"Unknown domain={normalized!r}; available: {sorted(DOMAIN_REGISTRY)}")
+        try:
+            get_domain_config(normalized)
+        except KeyError:
+            raise ValueError(f"Unknown domain={normalized!r}") from None
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -414,7 +415,7 @@ def main() -> int:
     action.add_argument("--doc-id", help="Index one document UUID")
     action.add_argument("--delete-doc-id", help="Delete all indexed points for one document UUID")
     action.add_argument("--changed-only", action="store_true", help="Index only changed/enabled documents in --domain")
-    parser.add_argument("--domain", choices=sorted(DOMAIN_REGISTRY), help="Required together with --changed-only")
+    parser.add_argument("--domain", help="Required together with --changed-only")
     args = parser.parse_args()
     if args.changed_only and not args.domain:
         parser.error("--domain is required with --changed-only")

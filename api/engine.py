@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from config import DOMAIN_REGISTRY, get_domain_config
+from config import BM25_MAX_CHUNKS
 
 # Reuse pure helpers that don't depend on module-level config
 from indexer.retriever import (
@@ -121,6 +121,18 @@ def _load_chunks_for_keyword_search(cfg: Dict[str, Any]) -> list:
                 compact_record["text"] = keyword_text
                 compact_record["original_text"] = text
                 chunks.append(compact_record)
+
+        # ── BM25 内存安全阈值 ──
+        # 当 chunk 数量超过 BM25_MAX_CHUNKS（默认 50000）时，
+        # 仅保留前 N 条，避免 HarmonyOS ~90k chunks 导致 OOM。
+        if len(chunks) > BM25_MAX_CHUNKS:
+            logger.warning(
+                "local BM25 chunk count %d exceeds safety cap %d for domain=%s; "
+                "truncating to first %d chunks. Set CODING_RAG_BM25_MAX_CHUNKS to override.",
+                len(chunks), BM25_MAX_CHUNKS, domain, BM25_MAX_CHUNKS,
+            )
+            chunks = chunks[:BM25_MAX_CHUNKS]
+
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.info("local BM25 chunks load done domain=%s chunks=%d elapsedMs=%d", domain, len(chunks), elapsed_ms)
         return chunks
@@ -193,12 +205,12 @@ def _result_key(r: dict) -> tuple:
     return (r.get("source_file", ""), r.get("chunk_index", r.get("context", "")))
 
 
-def _extract_technical_symbols(query: str) -> list[str]:
-    """Extract domain-agnostic technical symbols from a query.
+def _extract_technical_symbols(query: str, cfg: Optional[Dict[str, Any]] = None) -> list[tuple[str, float]]:
+    """Extract technical symbols from a query, returning (symbol, weight) pairs.
 
-    This intentionally relies on token shape rather than product/domain names:
-    config keys (`cleanup.policy`), directives (`try_files`), commands (`XREADGROUP`),
-    API identifiers (`generateRandomUUID`, `UIButton`), package-ish names, etc.
+    If cfg contains a ``known_identifiers`` list, matching tokens get weight 2.0
+    instead of the default 1.0.  This is intentionally domain-aware so that
+    ArkUI decorators like @Component get a bigger boost than generic camelCase tokens.
     """
     import re
 
@@ -206,8 +218,17 @@ def _extract_technical_symbols(query: str) -> list[str]:
         "http", "https", "request", "error", "code", "docs", "usage", "config",
         "configuration", "command", "directive", "nginx", "redis", "kafka", "ios", "arkui",
     }
+    known_set: set[str] = set()
+    if cfg:
+        for ident in cfg.get("known_identifiers", []):
+            known_set.add(ident.lower())
+            # Also add the bare word (e.g. "ListComponent" → "list")
+            bare = re.sub(r"[^A-Za-z0-9]", "", ident).lower()
+            if bare:
+                known_set.add(bare)
+
     raw_tokens = re.findall(r"[@A-Za-z_][A-Za-z0-9_@./:-]{2,}", query)
-    symbols: list[str] = []
+    symbols: list[tuple[str, float]] = []
     seen: set[str] = set()
     for raw in raw_tokens:
         token = raw.strip(".,;:()[]{}<>`'\"").lower()
@@ -223,9 +244,73 @@ def _extract_technical_symbols(query: str) -> list[str]:
             or raw.isupper()
         )
         if has_symbol_shape:
-            symbols.append(token)
+            weight = 2.0 if token in known_set else 1.0
+            symbols.append((token, weight))
             seen.add(token)
     return symbols
+
+
+# Backward-compatible wrapper: returns list[str] as before.
+def _extract_technical_symbols_simple(query: str) -> list[str]:
+    return [s for s, _w in _extract_technical_symbols(query)]
+
+
+def expand_query(query: str, domain: str) -> tuple[str, list[str]]:
+    """Expand a query with domain-specific synonym / expansion terms.
+
+    Returns (expanded_query_for_bm25, list_of_expanded_terms).
+    The original query is preserved for semantic search; expanded terms are
+    appended only for BM25 keyword search.
+    """
+    from api.registry import query_expansion_cache
+
+    expansions_map = query_expansion_cache.get_expansions(domain)
+
+    # Start with the symbols from the query
+    symbols = _extract_technical_symbols_simple(query)
+    expanded_terms: list[str] = []
+    seen_expansions: set[str] = set()
+
+    for symbol in symbols:
+        for key, expansion_terms in expansions_map.items():
+            if key.lower() == symbol or key.lower() in symbol:
+                for term in expansion_terms:
+                    term_lower = term.lower()
+                    if term_lower not in seen_expansions and term_lower not in {s.lower() for s in symbols}:
+                        expanded_terms.append(term)
+                        seen_expansions.add(term_lower)
+
+    # Also check raw query tokens against expansion keys (e.g. "ArkUI" in query text)
+    import re
+    raw_tokens = re.findall(r"[@A-Za-z_][A-Za-z0-9_@./:-]{2,}", query)
+    for raw in raw_tokens:
+        raw_lower = raw.lower()
+        if raw_lower in seen_expansions:
+            continue
+        for key, expansion_terms in expansions_map.items():
+            if key.lower() == raw_lower:
+                for term in expansion_terms:
+                    term_lower = term.lower()
+                    if term_lower not in seen_expansions and term_lower not in {s.lower() for s in symbols}:
+                        expanded_terms.append(term)
+                        seen_expansions.add(term_lower)
+
+    if not expanded_terms:
+        return query, []
+
+    expanded_query = query + " " + " ".join(expanded_terms)
+    return expanded_query, expanded_terms
+
+
+# Backward-compatible alias so existing callers that use _extract_technical_symbols(query)
+# (with just one arg) still get list[str].
+def __extract_technical_symbols_compat(query: str) -> list[str]:
+    return _extract_technical_symbols_simple(query)
+
+
+# Patch the module-level name so legacy callers work transparently.
+# New code should call _extract_technical_symbols_simple() for list[str]
+# or _extract_technical_symbols(query, cfg) for weighted tuples.
 
 
 def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[str]:
@@ -234,7 +319,7 @@ def _query_high_idf_terms(query: str, bm25: Any, min_idf: float = 5.0) -> list[s
     generic_stop = {"怎么", "如何", "什么", "为何", "为什么", "是否", "怎样", "的", "了", "和", "与", "或", "在", "是", "有", "中"}
     terms: list[str] = []
     seen = set()
-    for symbol in _extract_technical_symbols(query):
+    for symbol in _extract_technical_symbols_simple(query):
         terms.append(symbol)
         seen.add(symbol)
     for raw in jieba.cut(query):
@@ -303,7 +388,7 @@ def _protect_symbol_bm25_hits(results: List[dict], bm25_results: List[dict], que
     BM25 found chunks whose title/path/text contain them, those chunks should not
     be completely displaced by broader semantic neighbors before rerank/final top-k.
     """
-    symbols = _extract_technical_symbols(query)
+    symbols = _extract_technical_symbols_simple(query)
     if not symbols or not bm25_results:
         return results
 
@@ -613,6 +698,38 @@ class DomainQueryEngine:
             })
         return results
 
+        # ── Diagnostics ──
+
+    def _log_stage(self, stage: str, results: List[dict], limit: int = 5) -> None:
+        """Log compact retrieval diagnostics without dumping full document text."""
+        summary = []
+        for i, r in enumerate(results[:limit], 1):
+            summary.append({
+                "rank": i,
+                "score": round(float(r.get("score", r.get("semantic_score", r.get("bm25_score", 0.0))) or 0.0), 4),
+                "context": r.get("context", "")[:120],
+                "source_file": r.get("source_file", ""),
+                "text_len": len(r.get("text", "") or ""),
+            })
+        logger.info("RAG_STAGE domain=%s stage=%s count=%d top=%s", self.domain, stage, len(results), summary)
+
+    @staticmethod
+    def _snapshot_stage(results: List[dict], limit: int = 10) -> dict:
+        """Create a trace stage snapshot for debug output."""
+        entries = []
+        for i, r in enumerate(results[:limit], 1):
+            entries.append({
+                "rank": i,
+                "score": round(float(r.get("score", r.get("semantic_score", r.get("bm25_score", 0.0))) or 0.0), 4),
+                "source_file": r.get("source_file", ""),
+                "context": r.get("context", "")[:120],
+                "text_len": len(r.get("text", "") or ""),
+                "symbol_matches": r.get("symbol_matches"),
+                "bm25_rank": r.get("bm25_rank"),
+                "bm25_score": r.get("bm25_score") or r.get("bm25_score"),
+            })
+        return {"count": len(results), "top": entries}
+
     # ── Search orchestration ──
 
     def search(
@@ -622,9 +739,28 @@ class DomainQueryEngine:
         category: Optional[str] = None,
         has_code: Optional[bool] = None,
         method: str = "hybrid",
-    ) -> List[dict]:
+        debug: bool = False,
+    ) -> tuple[List[dict], Optional[dict]]:
+        """Execute search and return (results, trace_dict_or_None).
+
+        When debug=True, trace_dict contains per-stage snapshots.
+        When debug=False, trace_dict is None and behavior is unchanged.
+        """
+        trace: Optional[dict] = None
+        if debug:
+            symbols_list = _extract_technical_symbols_simple(query)
+            expanded_bm25_query, expanded_terms = expand_query(query, self.domain)
+            trace = {
+                "query": query,
+                "domain": self.domain,
+                "method": method,
+                "query_symbols": symbols_list,
+                "query_expansion": expanded_terms,
+                "expanded_bm25_query": expanded_bm25_query,
+            }
+
         logger.info(
-            "RAG_SEARCH_START domain=%s collection=%s method=%s top_k=%s category=%s has_code=%s query=%r",
+            "RAG_SEARCH_START domain=%s collection=%s method=%s top_k=%s category=%s has_code=%s query=%r debug=%s",
             self.domain,
             self.collection,
             method,
@@ -632,18 +768,15 @@ class DomainQueryEngine:
             category,
             has_code,
             query[:200],
+            debug,
         )
 
         if method == "semantic":
-            # Keep semantic mode mostly vector-based, but use a wider pool and
-            # domain-agnostic technical-symbol rerank so exact identifiers like
-            # `try_files`, `cleanup.policy`, `XREADGROUP` are not lost when they
-            # appear in vector candidates below topK.
-            candidate_k = max(top_k * 20, 100) if _extract_technical_symbols(query) else top_k
+            candidate_k = max(top_k * 20, 100) if _extract_technical_symbols_simple(query) else top_k
             results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("semantic_score")
-            symbols = _extract_technical_symbols(query)
+            symbols = _extract_technical_symbols_simple(query)
             if symbols:
                 for r in results:
                     matches = _technical_symbol_match_count(r, symbols)
@@ -653,27 +786,43 @@ class DomainQueryEngine:
                 results.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
             results = results[:top_k]
             self._log_stage("semantic", results)
-            return results
+            if trace:
+                trace["final"] = self._snapshot_stage(results)
+            return results, trace
 
         if method == "bm25":
-            results = self.bm25_search(query, top_k=top_k, category=category, has_code=has_code)
+            # When debug, use expanded query for BM25
+            bm25_query = query
+            if debug and trace:
+                bm25_query = trace.get("expanded_bm25_query", query)
+            elif not debug:
+                # Even without debug, use expanded query for BM25 (non-breaking improvement)
+                bm25_query, _ = expand_query(query, self.domain)
+            results = self.bm25_search(bm25_query, top_k=top_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("bm25_score")
             self._log_stage("bm25", results)
-            return results
+            if trace:
+                trace["final"] = self._snapshot_stage(results)
+            return results, trace
 
         # hybrid or rerank: run both, fuse, then optionally rerank.
-        # Rerank needs a wider candidate pool; otherwise weak first-stage fusion can
-        # drop exact API docs before the reranker sees them.
+        # When debug, use expanded query for BM25.
+        expanded_bm25_query, _ = expand_query(query, self.domain)
+        bm25_query = expanded_bm25_query if (expanded_bm25_query != query) else query
+
         candidate_k = max(top_k * 40, 200) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
         sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
-        bm25_results = self.bm25_search(query, top_k=candidate_k, category=category, has_code=has_code)
+        bm25_results = self.bm25_search(bm25_query, top_k=candidate_k, category=category, has_code=has_code)
         bm25_meta = {
             _result_key(r): {"bm25_rank": rank, "bm25_score": r.get("bm25_score", 0.0)}
             for rank, r in enumerate(bm25_results, 1)
         }
         self._log_stage("semantic_candidates", sem_results)
         self._log_stage("bm25_candidates", bm25_results)
+        if trace:
+            trace["semantic_candidates"] = self._snapshot_stage(sem_results)
+            trace["bm25_candidates"] = self._snapshot_stage(bm25_results)
 
         if not bm25_results:
             fused = []
@@ -692,26 +841,32 @@ class DomainQueryEngine:
                 bm25_only_boost=1.0,
             )
             fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
-            fused = identifier_boost(fused, query, boost_per_match=1.0)
+            # Build symbol_weights from known_identifiers for weighted boost
+            symbol_weights = self._build_symbol_weights()
+            fused = identifier_boost(fused, query, boost_per_match=1.0, symbol_weights=symbol_weights)
             fused = _protect_symbol_bm25_hits(fused, bm25_results, query, limit=max(top_k, 8))
         for item in fused:
             item.update(bm25_meta.get(_result_key(item), {}))
         self._log_stage("fusion", fused)
+        if trace:
+            trace["fusion"] = self._snapshot_stage(fused)
 
         if method in ("rerank", "hybrid_rerank"):
-            # Ask reranker for extra candidates, then filter noise + deduplicate.
-            # Comparison queries need balanced docs from both sides; skip field boost
-            # to avoid title-only API matches crowding out the paired concept guide.
             is_comparison = _is_comparison_query(query)
-            reranked = rerank_results(query, fused, top_k=max(top_k * 3, 15))
+            reranked = rerank_results(
+                query,
+                fused,
+                top_k=max(top_k * 3, 15),
+                api_base=self.rerank_api_base,
+                model_name=self.rerank_model_name,
+            )
             keyword_searcher, _ = _load_keyword_searcher_for_domain(self.cfg)
             bm25 = getattr(keyword_searcher, "_bm25", None) if keyword_searcher is not None else None
             if bm25 is not None and not _is_explanatory_query(query) and not is_comparison:
                 reranked = _field_match_rerank(reranked, query, bm25)
             # Always filter obvious noise regardless of query type.
             reranked = _drop_obvious_noise(reranked, query)
-            # Deduplicate by source_file — keep only the best scoring chunk per file
-            # so the top-k covers more distinct documents.
+            # Deduplicate by source_file
             seen_sources: set[str] = set()
             deduped: list[dict] = []
             for r in reranked:
@@ -721,23 +876,31 @@ class DomainQueryEngine:
                     deduped.append(r)
             reranked = deduped[:top_k]
             self._log_stage("rerank", reranked)
-            return reranked
-        return fused[:top_k]
+            if trace:
+                trace["rerank"] = self._snapshot_stage(reranked)
+                trace["final"] = self._snapshot_stage(reranked)
+            return reranked, trace
 
-    # ── Diagnostics ──
+        final_results = fused[:top_k]
+        if trace:
+            trace["final"] = self._snapshot_stage(final_results)
+        return final_results, trace
 
-    def _log_stage(self, stage: str, results: List[dict], limit: int = 5) -> None:
-        """Log compact retrieval diagnostics without dumping full document text."""
-        summary = []
-        for i, r in enumerate(results[:limit], 1):
-            summary.append({
-                "rank": i,
-                "score": round(float(r.get("score", r.get("semantic_score", r.get("bm25_score", 0.0))) or 0.0), 4),
-                "context": r.get("context", "")[:120],
-                "source_file": r.get("source_file", ""),
-                "text_len": len(r.get("text", "") or ""),
-            })
-        logger.info("RAG_STAGE domain=%s stage=%s count=%d top=%s", self.domain, stage, len(results), summary)
+    def _build_symbol_weights(self) -> Dict[str, float]:
+        """Build a symbol→weight mapping from domain's known_identifiers config."""
+        known = self.cfg.get("known_identifiers", [])
+        if not known:
+            return {}
+        weights: Dict[str, float] = {}
+        for ident in known:
+            key = ident.lower()
+            weights[key] = 2.0
+            # Also add bare alphanumeric version (e.g. @Component → component)
+            import re
+            bare = re.sub(r"[^A-Za-z0-9]", "", ident).lower()
+            if bare and bare != key:
+                weights[bare] = 2.0
+        return weights
 
     # ── Full RAG query ──
 
@@ -748,8 +911,11 @@ class DomainQueryEngine:
         category: Optional[str] = None,
         has_code: Optional[bool] = None,
         method: str = "hybrid",
+        debug: bool = False,
     ) -> dict:
-        results = self.search(question, top_k=top_k, category=category, has_code=has_code, method=method)
+        results, trace = self.search(
+            question, top_k=top_k, category=category, has_code=has_code, method=method, debug=debug,
+        )
         results = _expand_result_context(results, self.cfg)
         context = format_context(results)
         logger.info(
@@ -769,9 +935,12 @@ class DomainQueryEngine:
 
 请基于参考文档回答。如果文档中有代码示例，请一并给出。如果文档中没有相关信息，请说明。"""
 
-        return {
+        result = {
             "question": question,
             "results": results,
             "context": context,
             "prompt": prompt,
         }
+        if trace is not None:
+            result["trace"] = trace
+        return result
