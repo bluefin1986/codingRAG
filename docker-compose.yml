@@ -23,9 +23,58 @@ services:
       CODING_RAG_ES_API_KEY: ${CODING_RAG_ES_API_KEY:-}
       CODING_RAG_ES_INDEX_HARMONYOS: ${CODING_RAG_ES_INDEX_HARMONYOS:-codingrag_harmonyos_docs}
       CODING_RAG_ES_INDEX_IOS: ${CODING_RAG_ES_INDEX_IOS:-codingrag_ios_docs}
+      CODING_RAG_DATABASE_URL: ${CODING_RAG_DATABASE_URL:-postgresql://codingrag:codingrag@postgres:5432/codingrag}
+      CODING_RAG_STORAGE_BACKEND: ${CODING_RAG_STORAGE_BACKEND:-fastdfs}
+      CODING_RAG_FASTDFS_TRACKER: ${CODING_RAG_FASTDFS_TRACKER:-fastdfs-tracker:22122}
+      CODING_RAG_FASTDFS_DOWNLOAD_BASE_URL: ${CODING_RAG_FASTDFS_DOWNLOAD_BASE_URL:-http://fastdfs-storage:8888}
     depends_on:
       - qdrant
       - opensearch
+      - postgres
+      - fastdfs-tracker
+      - fastdfs-storage
+    restart: unless-stopped
+
+
+  postgres:
+    platform: linux/amd64
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: ${POSTGRES_CONTAINER_NAME:-codingrag-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-codingrag}
+      POSTGRES_USER: ${POSTGRES_USER:-codingrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codingrag}
+    volumes:
+      - ${POSTGRES_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  fastdfs-tracker:
+    platform: linux/amd64
+    image: ${FASTDFS_IMAGE:-delron/fastdfs:latest}
+    container_name: ${FASTDFS_TRACKER_CONTAINER_NAME:-codingrag-fastdfs-tracker}
+    command: tracker
+    ports:
+      - "${FASTDFS_TRACKER_PORT:-22122}:22122"
+    volumes:
+      - ${FASTDFS_TRACKER_DATA_DIR:-./data/fastdfs/tracker}:/var/fdfs
+    restart: unless-stopped
+
+  fastdfs-storage:
+    platform: linux/amd64
+    image: ${FASTDFS_IMAGE:-delron/fastdfs:latest}
+    container_name: ${FASTDFS_STORAGE_CONTAINER_NAME:-codingrag-fastdfs-storage}
+    command: storage
+    environment:
+      TRACKER_SERVER: ${FASTDFS_TRACKER_SERVER:-fastdfs-tracker:22122}
+    ports:
+      - "${FASTDFS_STORAGE_PORT:-23000}:23000"
+      - "${FASTDFS_HTTP_PORT:-8888}:8888"
+    volumes:
+      - ${FASTDFS_STORAGE_DATA_DIR:-./data/fastdfs/storage}:/var/fdfs
+    depends_on:
+      - fastdfs-tracker
     restart: unless-stopped
 
   qdrant:
