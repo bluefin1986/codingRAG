@@ -126,6 +126,10 @@ class ReindexJobCreateRequest(BaseModel):
 
     domain: str = Field(..., min_length=1, description="Formal domain whose changed documents should be indexed.")
     changed_only: bool = Field(True, description="Only documents already marked index_required are supported.")
+    index_target: Literal["both", "vector", "bm25"] = Field(
+        "both",
+        description="Index paths to rebuild. Use bm25 to repair keyword index without recomputing embeddings.",
+    )
 
 
 class QueryExpansionRequest(BaseModel):

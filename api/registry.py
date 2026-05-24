@@ -416,6 +416,8 @@ class DocumentRegistry:
                        COALESCE(COUNT(d.id) FILTER (WHERE d.enabled), 0)::int AS enabled_document_count,
                        COALESCE(COUNT(d.id) FILTER (WHERE d.index_required AND d.enabled), 0)::int AS index_required_count,
                        COALESCE(COUNT(d.id) FILTER (WHERE d.indexed_at IS NOT NULL AND d.enabled), 0)::int AS indexed_count,
+                       COALESCE(COUNT(d.id) FILTER (WHERE COALESCE(d.vector_indexed_at, d.indexed_at) IS NOT NULL AND d.enabled), 0)::int AS vector_indexed_count,
+                       COALESCE(COUNT(d.id) FILTER (WHERE d.bm25_indexed_at IS NOT NULL AND d.enabled), 0)::int AS bm25_indexed_count,
                        MAX(d.updated_at) AS documents_updated_at
                 FROM domains dm
                 LEFT JOIN doc_libraries l ON l.code = dm.domain_key AND l.enabled
@@ -991,43 +993,56 @@ class DocumentRegistry:
         *,
         changed_only: bool = True,
         mark_all: bool = False,
+        index_target: str = "both",
     ) -> dict[str, Any]:
         """Snapshot eligible documents into a background reindex job."""
         domain, _ = self._require_domain(domain)
         if not changed_only:
             raise ValueError("Only changed_only=true indexing is supported")
+        if index_target not in {"both", "vector", "bm25"}:
+            raise ValueError("index_target must be one of: both, vector, bm25")
         job_id = str(uuid.uuid4())
         with self._connect() as conn, conn.cursor() as cur:
             if mark_all:
                 # Get domain's current embedding model name for comparison
                 domain_item = next((d for d in self.list_domains() if d["domain_key"] == domain), None)
                 target_model = (domain_item or {}).get("embedding_model_name", "")
-                if target_model:
+                if index_target in {"both", "vector"} and target_model:
                     # Only mark docs whose current embedding model differs from target
                     cur.execute(
                         """
                         UPDATE documents
-                        SET index_required = TRUE, updated_at = now()
+                        SET index_required = TRUE, vector_index_required = TRUE, updated_at = now()
                         WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
-                          AND (embedding_model_name IS NULL OR embedding_model_name != %s OR indexed_at IS NULL)
+                          AND (embedding_model_name IS NULL OR embedding_model_name != %s OR vector_indexed_at IS NULL)
                         """,
                         [domain, target_model],
                     )
-                else:
+                elif index_target in {"both", "vector"}:
                     cur.execute(
                         """
                         UPDATE documents
-                        SET index_required = TRUE, updated_at = now()
+                        SET index_required = TRUE, vector_index_required = TRUE, updated_at = now()
                         WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
+                        """,
+                        [domain],
+                    )
+                if index_target in {"both", "bm25"}:
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET index_required = TRUE, bm25_index_required = TRUE, updated_at = now()
+                        WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
+                          AND bm25_indexed_at IS NULL
                         """,
                         [domain],
                     )
             cur.execute(
                 """
-                INSERT INTO reindex_jobs (id, domain, changed_only, status)
-                VALUES (%s, %s, %s, 'pending')
+                INSERT INTO reindex_jobs (id, domain, changed_only, index_target, status)
+                VALUES (%s, %s, %s, %s, 'pending')
                 """,
-                [job_id, domain, changed_only],
+                [job_id, domain, changed_only, index_target],
             )
             cur.execute(
                 """
@@ -1035,12 +1050,15 @@ class DocumentRegistry:
                 SELECT gen_random_uuid(), %s, d.id, 'pending'
                 FROM documents d
                 WHERE d.domain = %s
-                  AND d.index_required = TRUE
+                  AND (
+                    (%s IN ('both', 'vector') AND d.vector_index_required = TRUE)
+                    OR (%s IN ('both', 'bm25') AND d.bm25_index_required = TRUE)
+                  )
                   AND d.enabled = TRUE
                   AND d.deleted_at IS NULL
                 ORDER BY d.updated_at, d.id
                 """,
-                [job_id, domain],
+                [job_id, domain, index_target, index_target],
             )
             self._refresh_reindex_summary(cur, job_id)
             conn.commit()
@@ -1064,9 +1082,12 @@ class DocumentRegistry:
             params.append(status.strip().lower())
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._connect() as conn, conn.cursor() as cur:
+            self._reconcile_legacy_vector_reindex(cur)
+            conn.commit()
             cur.execute(
                 f"""
-                SELECT id, domain, changed_only, status, total, processed, indexed, failed,
+                SELECT id, domain, changed_only, index_target, status, total, processed, indexed,
+                       vector_indexed, bm25_indexed, failed,
                        retry_count, error_message, created_at, updated_at, started_at, finished_at
                 FROM reindex_jobs
                 {where_clause}
@@ -1080,6 +1101,8 @@ class DocumentRegistry:
     def get_reindex_job(self, job_id: str) -> dict[str, Any] | None:
         self.init_schema()
         with self._connect() as conn, conn.cursor() as cur:
+            self._reconcile_legacy_vector_reindex(cur, job_id=job_id)
+            conn.commit()
             cur.execute("SELECT * FROM reindex_jobs WHERE id = %s", [job_id])
             job = cur.fetchone()
             if not job:
@@ -1098,6 +1121,61 @@ class DocumentRegistry:
             )
             job["items"] = list(cur.fetchall())
             return job
+
+    def _reconcile_legacy_vector_reindex(self, cur, *, job_id: str | None = None) -> None:
+        """Classify successful items from pre-split workers as vector-only work."""
+        job_filter = "AND rj.id = %s" if job_id else ""
+        params = [job_id] if job_id else []
+        cur.execute(
+            f"""
+            UPDATE reindex_items ri
+            SET vector_indexed = TRUE
+            FROM reindex_jobs rj
+            WHERE ri.job_id = rj.id
+              AND rj.index_target = 'vector'
+              AND ri.status = 'indexed'
+              AND ri.vector_indexed = FALSE
+              {job_filter}
+            """,
+            params,
+        )
+        cur.execute(
+            f"""
+            UPDATE documents d
+            SET vector_indexed_at = COALESCE(d.vector_indexed_at, d.indexed_at),
+                vector_chunk_count = CASE WHEN d.vector_chunk_count = 0 THEN d.chunk_count ELSE d.vector_chunk_count END,
+                vector_index_required = FALSE
+            FROM reindex_items ri
+            JOIN reindex_jobs rj ON rj.id = ri.job_id
+            WHERE ri.document_id = d.id
+              AND rj.index_target = 'vector'
+              AND ri.status = 'indexed'
+              AND d.indexed_at IS NOT NULL
+              {job_filter}
+            """,
+            params,
+        )
+        cur.execute(
+            f"""
+            UPDATE reindex_jobs rj
+            SET vector_indexed = counts.vector_indexed,
+                bm25_indexed = counts.bm25_indexed,
+                updated_at = GREATEST(rj.updated_at, counts.updated_at)
+            FROM (
+                SELECT ri.job_id,
+                       COUNT(*) FILTER (WHERE ri.vector_indexed)::int AS vector_indexed,
+                       COUNT(*) FILTER (WHERE ri.bm25_indexed)::int AS bm25_indexed,
+                       MAX(ri.updated_at) AS updated_at
+                FROM reindex_items ri
+                JOIN reindex_jobs target ON target.id = ri.job_id
+                WHERE target.index_target = 'vector'
+                  {"AND target.id = %s" if job_id else ""}
+                GROUP BY ri.job_id
+            ) counts
+            WHERE rj.id = counts.job_id
+            """,
+            params,
+        )
 
     def retry_reindex_job(self, job_id: str) -> dict[str, Any]:
         self.init_schema()
@@ -1172,7 +1250,7 @@ class DocumentRegistry:
             indexer = PerDocumentIndexer(self.database_url)
             while True:
                 with self._connect() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT status FROM reindex_jobs WHERE id = %s", [job_id])
+                    cur.execute("SELECT status, index_target FROM reindex_jobs WHERE id = %s", [job_id])
                     job = cur.fetchone()
                     if not job or job["status"] != "running":
                         return self.get_reindex_job(job_id) or {}
@@ -1198,15 +1276,23 @@ class DocumentRegistry:
                     break
                 document_id = str(item["document_id"])
                 try:
-                    indexer.index_document(document_id)
+                    result = indexer.index_document(document_id, target=str(job["index_target"]))
                     with self._connect() as conn, conn.cursor() as cur:
                         cur.execute(
                             """
                             UPDATE reindex_items
-                            SET status = 'indexed', error_message = NULL, updated_at = now()
+                            SET status = 'indexed', error_message = NULL,
+                                vector_indexed = vector_indexed OR %s,
+                                bm25_indexed = bm25_indexed OR %s,
+                                updated_at = now()
                             WHERE job_id = %s AND document_id = %s AND status = 'processing'
                             """,
-                            [job_id, document_id],
+                            [
+                                bool(result.get("vector_indexed")),
+                                bool(result.get("bm25_indexed")),
+                                job_id,
+                                document_id,
+                            ],
                         )
                         self._refresh_reindex_summary(cur, job_id)
                         conn.commit()
@@ -1258,6 +1344,8 @@ class DocumentRegistry:
             SELECT COUNT(*)::int AS total,
                    COUNT(*) FILTER (WHERE status IN ('indexed', 'failed'))::int AS processed,
                    COUNT(*) FILTER (WHERE status = 'indexed')::int AS indexed,
+                   COUNT(*) FILTER (WHERE vector_indexed)::int AS vector_indexed,
+                   COUNT(*) FILTER (WHERE bm25_indexed)::int AS bm25_indexed,
                    COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
             FROM reindex_items
             WHERE job_id = %s
@@ -1268,11 +1356,20 @@ class DocumentRegistry:
         cur.execute(
             """
             UPDATE reindex_jobs
-            SET total = %s, processed = %s, indexed = %s, failed = %s,
+            SET total = %s, processed = %s, indexed = %s,
+                vector_indexed = %s, bm25_indexed = %s, failed = %s,
                 updated_at = now()
             WHERE id = %s
             """,
-            [counts["total"], counts["processed"], counts["indexed"], counts["failed"], job_id],
+            [
+                counts["total"],
+                counts["processed"],
+                counts["indexed"],
+                counts["vector_indexed"],
+                counts["bm25_indexed"],
+                counts["failed"],
+                job_id,
+            ],
         )
 
     def scan_domain(self, domain: str, *, limit: int | None = None) -> ScanResult:
@@ -1445,6 +1542,8 @@ class DocumentRegistry:
                 UPDATE documents
                 SET enabled = FALSE, status = 'deleted', deleted_at = now(),
                     indexed_at = NULL, chunk_count = 0, index_required = FALSE,
+                    vector_indexed_at = NULL, vector_chunk_count = 0, vector_index_required = FALSE,
+                    bm25_indexed_at = NULL, bm25_chunk_count = 0, bm25_index_required = FALSE,
                     error_message = NULL, updated_at = now()
                 WHERE library_id = %s AND deleted_at IS NULL
                 RETURNING id
@@ -1494,7 +1593,11 @@ class DocumentRegistry:
                 SELECT d.id AS id, d.id AS document_id, d.library_id, d.domain,
                        d.title, d.relative_path, d.status, d.chunk_count,
                        d.index_required, d.indexed_at, d.last_index_error_at,
-                       d.error_message, d.updated_at, l.code AS library_code,
+                       d.error_message, d.vector_chunk_count, d.vector_index_required,
+                       d.vector_indexed_at, d.vector_last_index_error_at, d.vector_error_message,
+                       d.bm25_chunk_count, d.bm25_index_required, d.bm25_indexed_at,
+                       d.bm25_last_index_error_at, d.bm25_error_message,
+                       d.updated_at, l.code AS library_code,
                        l.qdrant_collection, l.opensearch_index
                 FROM documents d
                 JOIN doc_libraries l ON l.id = d.library_id
@@ -1555,11 +1658,13 @@ class DocumentRegistry:
                 SET enabled = %s,
                     status = %s,
                     index_required = CASE WHEN %s THEN TRUE ELSE index_required END,
+                    vector_index_required = CASE WHEN %s THEN TRUE ELSE vector_index_required END,
+                    bm25_index_required = CASE WHEN %s THEN TRUE ELSE bm25_index_required END,
                     updated_at = now()
                 WHERE id = %s AND deleted_at IS NULL
                 RETURNING *
                 """,
-                [enabled, status, enabled, document_id],
+                [enabled, status, enabled, enabled, enabled, document_id],
             )
             row = cur.fetchone()
             conn.commit()
@@ -1668,6 +1773,8 @@ class DocumentRegistry:
                     content_length = %s,
                     status = 'changed',
                     index_required = TRUE,
+                    vector_index_required = TRUE,
+                    bm25_index_required = TRUE,
                     error_message = NULL,
                     updated_at = now()
                 WHERE id = %s AND deleted_at IS NULL
@@ -2294,7 +2401,9 @@ class DocumentRegistry:
             UPDATE documents SET
               title = %s, source_url = %s, source_file = %s, local_path = %s, relative_path = %s,
               mime_type = %s, language = %s, content_hash = %s, content_length = %s, version = %s,
-              enabled = %s, status = 'changed', index_required = TRUE, error_message = NULL, updated_at = now(), metadata = %s::jsonb
+              enabled = %s, status = 'changed', index_required = TRUE,
+              vector_index_required = TRUE, bm25_index_required = TRUE,
+              error_message = NULL, updated_at = now(), metadata = %s::jsonb
             WHERE id = %s
             """,
             [
@@ -2460,7 +2569,8 @@ class DocumentRegistry:
               title = %s, source_file = %s, local_path = %s, relative_path = %s,
               mime_type = %s, language = %s, content_hash = %s, content_length = %s,
               version = %s, status = 'changed', last_scanned_at = now(), scan_run_id = %s,
-              index_required = TRUE, error_message = NULL, updated_at = now()
+              index_required = TRUE, vector_index_required = TRUE, bm25_index_required = TRUE,
+              error_message = NULL, updated_at = now()
             WHERE id = %s
             """,
             [
@@ -2861,6 +2971,21 @@ CREATE INDEX IF NOT EXISTS idx_document_retention_jobs_status ON document_retent
 MIGRATION_SQL = """
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_model_name TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS vector_indexed_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS vector_chunk_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS vector_index_required BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS vector_last_index_error_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS vector_error_message TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS bm25_indexed_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS bm25_chunk_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS bm25_index_required BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS bm25_last_index_error_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS bm25_error_message TEXT;
+UPDATE documents
+SET vector_indexed_at = COALESCE(vector_indexed_at, indexed_at),
+    vector_chunk_count = CASE WHEN vector_chunk_count = 0 THEN chunk_count ELSE vector_chunk_count END,
+    vector_index_required = CASE WHEN indexed_at IS NOT NULL AND index_required = FALSE THEN FALSE ELSE vector_index_required END
+WHERE indexed_at IS NOT NULL;
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS retrieval_mode TEXT NOT NULL DEFAULT 'hybrid_rerank';
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS embedding_model_name TEXT;
@@ -2987,10 +3112,13 @@ CREATE TABLE IF NOT EXISTS reindex_jobs (
     id UUID PRIMARY KEY,
     domain TEXT NOT NULL,
     changed_only BOOLEAN NOT NULL DEFAULT TRUE,
+    index_target TEXT NOT NULL DEFAULT 'both',
     status TEXT NOT NULL DEFAULT 'pending',
     total INTEGER NOT NULL DEFAULT 0,
     processed INTEGER NOT NULL DEFAULT 0,
     indexed INTEGER NOT NULL DEFAULT 0,
+    vector_indexed INTEGER NOT NULL DEFAULT 0,
+    bm25_indexed INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
@@ -2999,6 +3127,7 @@ CREATE TABLE IF NOT EXISTS reindex_jobs (
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     CHECK (changed_only = TRUE),
+    CHECK (index_target IN ('both', 'vector', 'bm25')),
     CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled'))
 );
 CREATE INDEX IF NOT EXISTS idx_reindex_jobs_domain ON reindex_jobs(domain);
@@ -3009,6 +3138,8 @@ CREATE TABLE IF NOT EXISTS reindex_items (
     job_id UUID NOT NULL REFERENCES reindex_jobs(id),
     document_id UUID NOT NULL REFERENCES documents(id),
     status TEXT NOT NULL DEFAULT 'pending',
+    vector_indexed BOOLEAN NOT NULL DEFAULT FALSE,
+    bm25_indexed BOOLEAN NOT NULL DEFAULT FALSE,
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -3017,4 +3148,14 @@ CREATE TABLE IF NOT EXISTS reindex_items (
 );
 CREATE INDEX IF NOT EXISTS idx_reindex_items_job_id ON reindex_items(job_id);
 CREATE INDEX IF NOT EXISTS idx_reindex_items_status ON reindex_items(status);
+ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS index_target TEXT NOT NULL DEFAULT 'vector';
+ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS vector_indexed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS bm25_indexed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reindex_items ADD COLUMN IF NOT EXISTS vector_indexed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE reindex_items ADD COLUMN IF NOT EXISTS bm25_indexed BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE reindex_items ri
+SET vector_indexed = TRUE
+FROM reindex_jobs rj
+WHERE ri.job_id = rj.id AND rj.index_target = 'vector' AND ri.status = 'indexed'
+  AND ri.vector_indexed = FALSE;
 """

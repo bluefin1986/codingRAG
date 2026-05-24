@@ -229,11 +229,19 @@ def delete_domain(domain_key: str):
 
 
 @app.post("/api/domains/{domain_key}/reindex-all")
-def reindex_all_docs(domain_key: str):
+def reindex_all_docs(
+    domain_key: str,
+    index_target: str = Query("both", pattern="^(both|vector|bm25)$"),
+):
     """Mark all enabled documents and enqueue a background reindex job."""
     normalized = domain_key.strip().lower()
     try:
-        return _get_registry().create_reindex_job(normalized, changed_only=True, mark_all=True)
+        return _get_registry().create_reindex_job(
+            normalized,
+            changed_only=True,
+            mark_all=True,
+            index_target=index_target,
+        )
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
@@ -424,7 +432,11 @@ def cancel_ingest_job(job_id: str):
 def create_reindex_job(req: ReindexJobCreateRequest):
     """Queue changed documents for background indexing."""
     try:
-        return _get_registry().create_reindex_job(req.domain, changed_only=req.changed_only)
+        return _get_registry().create_reindex_job(
+            req.domain,
+            changed_only=req.changed_only,
+            index_target=req.index_target,
+        )
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
@@ -580,10 +592,15 @@ def list_docs(
 def reindex_changed_docs(
     domain: str = Query(..., description="Domain whose changed documents should be reindexed"),
     changed_only: bool = Query(True, description="Only index enabled documents that require indexing"),
+    index_target: str = Query("both", pattern="^(both|vector|bm25)$"),
 ):
     """Compatibility endpoint that now queues a background reindex job."""
     try:
-        return _get_registry().create_reindex_job(domain, changed_only=changed_only)
+        return _get_registry().create_reindex_job(
+            domain,
+            changed_only=changed_only,
+            index_target=index_target,
+        )
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
@@ -595,9 +612,12 @@ def reindex_changed_docs(
 
 
 @app.post("/api/docs/{document_id}/reindex")
-def reindex_doc(document_id: str):
+def reindex_doc(
+    document_id: str,
+    index_target: str = Query("both", pattern="^(both|vector|bm25)$"),
+):
     try:
-        return PerDocumentIndexer().index_document(document_id)
+        return PerDocumentIndexer().index_document(document_id, target=index_target)
     except DocumentNotFound:
         raise HTTPException(status_code=404, detail="Document not found")
     except DocumentDisabled as e:

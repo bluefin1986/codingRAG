@@ -266,39 +266,66 @@ class PerDocumentIndexer:
             )
         return points
 
-    def _mark_indexed(self, doc_id: str, chunk_count: int, embedding_model: str = "", embedding_model_name: str = "") -> None:
-        with self._connect() as conn, conn.cursor() as cur:
-            if embedding_model or embedding_model_name:
-                cur.execute(
-                    """
-                    UPDATE documents
-                    SET indexed_at = now(), chunk_count = %s, status = 'indexed',
-                        error_message = NULL, index_required = FALSE, updated_at = now(),
-                        embedding_model = COALESCE(%s, embedding_model),
-                        embedding_model_name = COALESCE(%s, embedding_model_name)
-                    WHERE id = %s AND deleted_at IS NULL
-                    """,
-                    [chunk_count, embedding_model or None, embedding_model_name or None, doc_id],
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE documents
-                    SET indexed_at = now(), chunk_count = %s, status = 'indexed',
-                        error_message = NULL, index_required = FALSE, updated_at = now()
-                    WHERE id = %s AND deleted_at IS NULL
-                    """,
-                    [chunk_count, doc_id],
-                )
-            conn.commit()
-
-    def _mark_failed(self, doc_id: str, error: Exception) -> None:
+    def _mark_vector_indexed(
+        self,
+        doc_id: str,
+        chunk_count: int,
+        embedding_model: str = "",
+        embedding_model_name: str = "",
+    ) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE documents
-                SET status = 'failed', error_message = %s,
-                    last_index_error_at = now(), index_required = TRUE, updated_at = now()
+                SET indexed_at = now(), chunk_count = %s, status = 'indexed',
+                    vector_indexed_at = now(), vector_chunk_count = %s,
+                    vector_error_message = NULL, vector_index_required = FALSE,
+                    error_message = bm25_error_message,
+                    index_required = bm25_index_required, updated_at = now(),
+                    embedding_model = COALESCE(%s, embedding_model),
+                    embedding_model_name = COALESCE(%s, embedding_model_name)
+                WHERE id = %s AND deleted_at IS NULL
+                """,
+                [chunk_count, chunk_count, embedding_model or None, embedding_model_name or None, doc_id],
+            )
+            conn.commit()
+
+    def _mark_bm25_indexed(self, doc_id: str, chunk_count: int) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET bm25_indexed_at = now(), bm25_chunk_count = %s,
+                    bm25_error_message = NULL, bm25_index_required = FALSE,
+                    error_message = vector_error_message,
+                    index_required = vector_index_required, updated_at = now()
+                WHERE id = %s AND deleted_at IS NULL
+                """,
+                [chunk_count, doc_id],
+            )
+            conn.commit()
+
+    def _mark_vector_failed(self, doc_id: str, error: Exception) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET status = 'failed', error_message = %s, vector_error_message = %s,
+                    last_index_error_at = now(), vector_last_index_error_at = now(),
+                    index_required = TRUE, vector_index_required = TRUE, updated_at = now()
+                WHERE id = %s AND deleted_at IS NULL
+                """,
+                [str(error)[:2000], str(error)[:2000], doc_id],
+            )
+            conn.commit()
+
+    def _mark_bm25_failed(self, doc_id: str, error: Exception) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET bm25_error_message = %s, bm25_last_index_error_at = now(),
+                    index_required = TRUE, bm25_index_required = TRUE, updated_at = now()
                 WHERE id = %s AND deleted_at IS NULL
                 """,
                 [str(error)[:2000], doc_id],
@@ -311,82 +338,100 @@ class PerDocumentIndexer:
                 """
                 UPDATE documents
                 SET indexed_at = NULL, chunk_count = 0,
+                    vector_indexed_at = NULL, vector_chunk_count = 0,
+                    bm25_indexed_at = NULL, bm25_chunk_count = 0,
                     status = CASE WHEN %s THEN 'changed' ELSE status END,
                     index_required = CASE WHEN %s THEN TRUE ELSE index_required END,
+                    vector_index_required = CASE WHEN %s THEN TRUE ELSE vector_index_required END,
+                    bm25_index_required = CASE WHEN %s THEN TRUE ELSE bm25_index_required END,
                     updated_at = now()
                 WHERE id = %s AND deleted_at IS NULL
                 """,
-                [enabled, enabled, doc_id],
+                [enabled, enabled, enabled, enabled, doc_id],
             )
             conn.commit()
 
-    def index_document(self, doc_id: str) -> dict[str, Any]:
+    def index_document(self, doc_id: str, *, target: str = "both") -> dict[str, Any]:
+        if target not in {"both", "vector", "bm25"}:
+            raise ValueError("target must be one of: both, vector, bm25")
         document = self._load_document(doc_id)
         if not document["enabled"]:
             raise DocumentDisabled(f"Document is disabled: {doc_id}")
 
-        try:
-            cfg = self._domain_config(document)
-            collection = self._collection(document, cfg)
-            content = self._read_current_content(document)
-            chunks = split_blocks(
-                parse_blocks(content),
-                source_file=document.get("effective_source_file") or "",
-                max_tokens=CHUNK_MAX_TOKENS,
-                min_tokens=CHUNK_MIN_TOKENS,
-                overlap_tokens=CHUNK_OVERLAP_TOKENS,
-            )
-            for chunk in chunks:
-                chunk.text = clean_text(chunk.text, cfg.get("noise_patterns", []))
-            chunks = [chunk for chunk in chunks if chunk.text.strip()]
-            texts = [truncate_text(chunk.text) for chunk in chunks]
-            embeddings = (
-                embed_texts(
-                    texts,
-                    api_base=EMBEDDING_API_BASE,
-                    model_name=cfg["embedding_model_name"],
+        cfg = self._domain_config(document)
+        collection = self._collection(document, cfg)
+        content = self._read_current_content(document)
+        chunks = split_blocks(
+            parse_blocks(content),
+            source_file=document.get("effective_source_file") or "",
+            max_tokens=CHUNK_MAX_TOKENS,
+            min_tokens=CHUNK_MIN_TOKENS,
+            overlap_tokens=CHUNK_OVERLAP_TOKENS,
+        )
+        for chunk in chunks:
+            chunk.text = clean_text(chunk.text, cfg.get("noise_patterns", []))
+        chunks = [chunk for chunk in chunks if chunk.text.strip()]
+        vector_count = int(document.get("vector_chunk_count") or document.get("chunk_count") or 0)
+        bm25_count = int(document.get("bm25_chunk_count") or 0)
+
+        if target in {"both", "vector"}:
+            try:
+                texts = [truncate_text(chunk.text) for chunk in chunks]
+                embeddings = (
+                    embed_texts(
+                        texts,
+                        api_base=EMBEDDING_API_BASE,
+                        model_name=cfg["embedding_model_name"],
+                    )
+                    if texts
+                    else []
                 )
-                if texts
-                else []
-            )
-            if len(embeddings) != len(chunks):
-                raise RuntimeError(f"Embedding count mismatch: chunks={len(chunks)} vectors={len(embeddings)}")
-            points = self._build_points(document, chunks, embeddings)
-            with self._qdrant_client() as client:
-                self._ensure_collection(client, collection, int(cfg["embedding_dim"]))
-                self._delete_qdrant_points(client, collection, doc_id)
-                self._upsert_points(client, collection, points)
-            # ES keyword index (skip silently if not configured)
-            es_indexer = self._get_es_indexer(document)
-            es_count = 0
-            if es_indexer is not None:
+                if len(embeddings) != len(chunks):
+                    raise RuntimeError(f"Embedding count mismatch: chunks={len(chunks)} vectors={len(embeddings)}")
+                points = self._build_points(document, chunks, embeddings)
+                with self._qdrant_client() as client:
+                    self._ensure_collection(client, collection, int(cfg["embedding_dim"]))
+                    self._delete_qdrant_points(client, collection, doc_id)
+                    self._upsert_points(client, collection, points)
+                vector_count = len(points)
+                self._mark_vector_indexed(
+                    doc_id,
+                    vector_count,
+                    embedding_model=cfg.get("embedding_model", ""),
+                    embedding_model_name=cfg.get("embedding_model_name", ""),
+                )
+            except Exception as exc:
+                self._mark_vector_failed(doc_id, exc)
+                raise
+
+        if target in {"both", "bm25"}:
+            try:
+                es_indexer = self._get_es_indexer(document)
+                if es_indexer is None:
+                    raise RuntimeError("BM25/OpenSearch indexing is not configured for this library")
                 try:
                     es_indexer.delete_by_doc_id(doc_id)
-                    es_chunks = self._build_es_chunks(document, chunks)
-                    es_count = es_indexer.index_document_chunks(es_chunks)
+                    bm25_count = es_indexer.index_document_chunks(self._build_es_chunks(document, chunks))
+                finally:
                     es_indexer.close()
-                except Exception:
-                    logger.exception("ES indexing failed for doc_id=%s (Qdrant succeeded)", doc_id)
-            self._mark_indexed(
-                doc_id,
-                len(points),
-                embedding_model=cfg.get("embedding_model", ""),
-                embedding_model_name=cfg.get("embedding_model_name", ""),
-            )
-            result: dict[str, Any] = {
-                "doc_id": doc_id,
-                "domain": document["domain"],
-                "collection": collection,
-                "document_version": int(document["document_version"]),
-                "chunk_count": len(points),
-                "status": "indexed",
-            }
-            if es_count:
-                result["es_chunk_count"] = es_count
-            return result
-        except Exception as exc:
-            self._mark_failed(doc_id, exc)
-            raise
+                self._mark_bm25_indexed(doc_id, bm25_count)
+            except Exception as exc:
+                self._mark_bm25_failed(doc_id, exc)
+                raise
+
+        return {
+            "doc_id": doc_id,
+            "domain": document["domain"],
+            "collection": collection,
+            "document_version": int(document["document_version"]),
+            "chunk_count": vector_count,
+            "vector_chunk_count": vector_count,
+            "bm25_chunk_count": bm25_count,
+            "index_target": target,
+            "vector_indexed": target in {"both", "vector"},
+            "bm25_indexed": target in {"both", "bm25"},
+            "status": "indexed",
+        }
 
     def delete_document_index(self, doc_id: str) -> dict[str, Any]:
         document = self._load_document(doc_id)
@@ -462,7 +507,7 @@ class PerDocumentIndexer:
             "items": items,
         }
 
-    def reindex_changed(self, domain: str) -> dict[str, Any]:
+    def reindex_changed(self, domain: str, *, target: str = "both") -> dict[str, Any]:
         normalized = domain.strip().lower()
         try:
             get_domain_config(normalized)
@@ -472,23 +517,27 @@ class PerDocumentIndexer:
             cur.execute(
                 """
                 SELECT id FROM documents
-                WHERE domain = %s AND index_required = TRUE AND enabled = TRUE AND deleted_at IS NULL
+                WHERE domain = %s AND (
+                  (%s IN ('both', 'vector') AND vector_index_required = TRUE)
+                  OR (%s IN ('both', 'bm25') AND bm25_index_required = TRUE)
+                ) AND enabled = TRUE AND deleted_at IS NULL
                 ORDER BY updated_at, id
                 """,
-                [normalized],
+                [normalized, target, target],
             )
             doc_ids = [str(row["id"]) for row in cur.fetchall()]
         results: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
         for doc_id in doc_ids:
             try:
-                results.append(self.index_document(doc_id))
+                results.append(self.index_document(doc_id, target=target))
             except Exception as exc:
                 logger.exception("Per-document indexing failed for doc_id=%s", doc_id)
                 failures.append({"doc_id": doc_id, "error": str(exc)})
         return {
             "domain": normalized,
             "changed_only": True,
+            "index_target": target,
             "total": len(doc_ids),
             "indexed": len(results),
             "failed": len(failures),
@@ -504,17 +553,18 @@ def main() -> int:
     action.add_argument("--delete-doc-id", help="Delete all indexed points for one document UUID")
     action.add_argument("--changed-only", action="store_true", help="Index only changed/enabled documents in --domain")
     parser.add_argument("--domain", help="Required together with --changed-only")
+    parser.add_argument("--target", choices=["both", "vector", "bm25"], default="both")
     args = parser.parse_args()
     if args.changed_only and not args.domain:
         parser.error("--domain is required with --changed-only")
 
     indexer = PerDocumentIndexer()
     if args.doc_id:
-        result = indexer.index_document(args.doc_id)
+        result = indexer.index_document(args.doc_id, target=args.target)
     elif args.delete_doc_id:
         result = indexer.delete_document_index(args.delete_doc_id)
     else:
-        result = indexer.reindex_changed(args.domain)
+        result = indexer.reindex_changed(args.domain, target=args.target)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
