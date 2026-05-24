@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run pending codingRAG library import jobs.
+"""Run pending codingRAG library import and registration-only ingest jobs.
 
 Usage:
   python3 scripts/library_import_worker.py --once
   python3 scripts/library_import_worker.py --job-id <uuid>
+  python3 scripts/library_import_worker.py --ingest-job-id <uuid>
 """
 from __future__ import annotations
 
@@ -23,8 +24,10 @@ from config import CODING_RAG_IMPORT_BATCH_SIZE  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="codingRAG async library import worker")
-    parser.add_argument("--job-id", help="Run one specific pending/failed import job")
+    parser = argparse.ArgumentParser(description="codingRAG async library import / ingest worker")
+    parser.add_argument("--job-id", help="Run one specific pending/failed archive import job")
+    parser.add_argument("--ingest-job-id", help="Run one specific pending/failed registration-only ingest job")
+    parser.add_argument("--ingest-only", action="store_true", help="Poll registration-only ingest jobs, not archive imports")
     parser.add_argument("--once", action="store_true", help="Run pending jobs once and exit")
     parser.add_argument("--limit", type=int, default=1, help="Max pending jobs per pass")
     parser.add_argument("--batch-size", type=int, default=CODING_RAG_IMPORT_BATCH_SIZE, help="Documents per DB batch")
@@ -35,13 +38,21 @@ def main() -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     registry = DocumentRegistry()
 
+    if args.ingest_job_id:
+        result = registry.run_ingest_job(args.ingest_job_id)
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return 0
+
     if args.job_id:
         result = registry.run_import_job(args.job_id, batch_size=args.batch_size)
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0
 
     while True:
-        results = registry.run_pending_import_jobs(limit=args.limit, batch_size=args.batch_size)
+        results = []
+        if not args.ingest_only:
+            results.extend(registry.run_pending_import_jobs(limit=args.limit, batch_size=args.batch_size))
+        results.extend(registry.run_pending_ingest_jobs(limit=args.limit))
         if results:
             print(json.dumps(results, ensure_ascii=False, default=str))
         if args.once:

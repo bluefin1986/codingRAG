@@ -35,6 +35,7 @@ from api.storage import create_storage
 
 TEXT_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".html", ".htm", ".rst"}
 DEFAULT_RETENTION_VERSIONS = 2
+INGEST_STAGING_ROOT = Path(__file__).resolve().parents[1] / "output" / "ingest-jobs"
 logger = logging.getLogger(__name__)
 _SCHEMA_INIT_LOCK = threading.Lock()
 _INITIALIZED_SCHEMA_URLS: set[str] = set()
@@ -55,6 +56,10 @@ class ScanResult:
 
 class RegistryUnavailable(RuntimeError):
     pass
+
+
+class IngestStateConflict(ValueError):
+    """Raised when an ingest action is incompatible with the current job state."""
 
 
 class DomainCache:
@@ -378,6 +383,7 @@ class DocumentRegistry:
         cur.execute(MIGRATION_SQL)
         cur.execute(DOMAIN_SCHEMA_SQL)
         cur.execute(QUERY_EXPANSION_SCHEMA_SQL)
+        cur.execute(INGEST_SCHEMA_SQL)
 
     def list_libraries(self) -> list[dict[str, Any]]:
         self.init_schema()
@@ -394,6 +400,589 @@ class DocumentRegistry:
                 """
             )
             return list(cur.fetchall())
+
+    def list_knowledge_bases(self) -> list[dict[str, Any]]:
+        """Return enabled formal domains with their primary library and ingest summary."""
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dm.domain_key, dm.display_name, dm.language, dm.docs_dir, dm.collection,
+                       dm.enabled, dm.created_at, dm.updated_at,
+                       l.id AS library_id, l.code AS library_code, l.name AS library_name,
+                       l.source_type AS library_source_type,
+                       COALESCE(COUNT(d.id), 0)::int AS document_count,
+                       COALESCE(COUNT(d.id) FILTER (WHERE d.enabled), 0)::int AS enabled_document_count,
+                       COALESCE(COUNT(d.id) FILTER (WHERE d.index_required AND d.enabled), 0)::int AS index_required_count,
+                       COALESCE(COUNT(d.id) FILTER (WHERE d.indexed_at IS NOT NULL AND d.enabled), 0)::int AS indexed_count,
+                       MAX(d.updated_at) AS documents_updated_at
+                FROM domains dm
+                LEFT JOIN doc_libraries l ON l.code = dm.domain_key AND l.enabled
+                LEFT JOIN documents d ON d.library_id = l.id AND d.deleted_at IS NULL
+                WHERE dm.enabled
+                GROUP BY dm.domain_key, dm.display_name, dm.language, dm.docs_dir, dm.collection,
+                         dm.enabled, dm.created_at, dm.updated_at, l.id, l.code, l.name, l.source_type
+                ORDER BY dm.domain_key
+                """
+            )
+            rows = list(cur.fetchall())
+            for row in rows:
+                cur.execute(
+                    """
+                    SELECT id, status, source_type, summary, created_at, started_at, finished_at
+                    FROM knowledge_ingest_jobs
+                    WHERE domain = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    [row["domain_key"]],
+                )
+                row["latest_ingest_job"] = cur.fetchone()
+            return rows
+
+    def list_knowledge_base_documents(
+        self,
+        domain: str,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        self._require_domain(domain)
+        return self.list_documents(domain=domain, status=status, q=q, limit=limit, offset=offset)
+
+    def create_ingest_job(self, domain: str, *, source_type: str = "files", batch_size: int | None = None) -> dict[str, Any]:
+        """Create one registration-only async job targeting the primary domain library."""
+        domain, cfg = self._require_domain(domain)
+        source_type = (source_type or "files").strip().lower()
+        if source_type in {"files", "directory", "upload"}:
+            normalized_source = "upload"
+        elif source_type == "server_dir":
+            normalized_source = "server_dir"
+        else:
+            raise ValueError("source_type must be files, directory, or server_dir")
+        batch_size = max(1, min(int(batch_size or CODING_RAG_IMPORT_BATCH_SIZE or 100), 1000))
+        job_id = str(uuid.uuid4())
+        status = "accepting"
+        summary = self._empty_ingest_summary(source_type=normalized_source, batch_size=batch_size)
+        with self._connect() as conn, conn.cursor() as cur:
+            library_id = self._upsert_domain_library(cur, domain, cfg)
+            cur.execute(
+                """
+                INSERT INTO knowledge_ingest_jobs (
+                  id, domain, library_id, source_type, operation, status, batch_size, summary
+                ) VALUES (%s, %s, %s, %s, 'register', %s, %s, %s::jsonb)
+                RETURNING *
+                """,
+                [job_id, domain, library_id, normalized_source, status, batch_size, Jsonb(summary)],
+            )
+            job = cur.fetchone()
+            conn.commit()
+        return job
+
+    def stage_ingest_files(self, job_id: str, files: list[tuple[str, bytes]]) -> dict[str, Any]:
+        """Stage one upload batch while the job remains unavailable to workers."""
+        self.init_schema()
+        if not files:
+            raise ValueError("at least one file is required")
+        normalized: list[tuple[str, bytes]] = []
+        seen: set[str] = set()
+        for relative_path, content in files:
+            rel = validate_ingest_relative_path(relative_path)
+            if rel in seen:
+                raise ValueError(f"duplicate relative_path in upload: {rel}")
+            if Path(rel).suffix.lower() not in TEXT_EXTENSIONS:
+                raise ValueError(f"unsupported document extension: {rel}")
+            seen.add(rel)
+            normalized.append((rel, content))
+
+        staging_root = (INGEST_STAGING_ROOT / job_id / "uploads").resolve()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT source_type, status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE",
+                [job_id],
+            )
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["source_type"] != "upload":
+                raise ValueError("files can only be submitted to upload ingest jobs")
+            if job["status"] != "accepting":
+                raise IngestStateConflict(
+                    f"cannot add files to {job['status']} ingest job; uploads are closed after completion"
+                )
+            staged_rows: list[tuple[str, Path, int]] = []
+            for relative_path, content in normalized:
+                target = (staging_root / relative_path).resolve()
+                if staging_root not in target.parents:
+                    raise ValueError(f"relative_path escapes staging root: {relative_path}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+                staged_rows.append((relative_path, target, len(content)))
+            for relative_path, target, content_length in staged_rows:
+                cur.execute(
+                    """
+                    INSERT INTO knowledge_ingest_items (
+                      id, job_id, relative_path, source_path, status, content_length, metadata
+                    ) VALUES (%s, %s, %s, %s, 'pending', %s, %s::jsonb)
+                    ON CONFLICT (job_id, relative_path) DO UPDATE SET
+                      source_path = EXCLUDED.source_path,
+                      status = 'pending',
+                      document_id = NULL,
+                      action = NULL,
+                      content_length = EXCLUDED.content_length,
+                      error_message = NULL,
+                      metadata = EXCLUDED.metadata,
+                      updated_at = now()
+                    """,
+                    [
+                        str(uuid.uuid4()),
+                        job_id,
+                        relative_path,
+                        str(target),
+                        content_length,
+                        Jsonb({"source_type": "upload"}),
+                    ],
+                )
+            self._refresh_ingest_summary(cur, job_id)
+            conn.commit()
+        return self.get_ingest_job(job_id) or {}
+
+    def complete_ingest_upload(self, job_id: str) -> dict[str, Any]:
+        """Close an upload job for file submission and make it eligible for a worker."""
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT source_type, status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE",
+                [job_id],
+            )
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["source_type"] != "upload":
+                raise ValueError("complete can only be used with upload ingest jobs")
+            if job["status"] != "accepting":
+                raise IngestStateConflict(
+                    f"cannot complete {job['status']} ingest job; upload job is no longer accepting files"
+                )
+            cur.execute("SELECT COUNT(*)::int AS count FROM knowledge_ingest_items WHERE job_id = %s", [job_id])
+            if cur.fetchone()["count"] < 1:
+                raise IngestStateConflict("cannot complete upload ingest job without staged files")
+            self._refresh_ingest_summary(cur, job_id)
+            cur.execute(
+                """
+                UPDATE knowledge_ingest_jobs
+                SET status = 'pending', error_message = NULL, finished_at = NULL, updated_at = now()
+                WHERE id = %s
+                """,
+                [job_id],
+            )
+            conn.commit()
+        return self.get_ingest_job(job_id) or {}
+
+    def queue_server_dir_ingest(
+        self,
+        job_id: str,
+        *,
+        limit: int | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Queue configured docs_dir discovery; the worker registers matching files later."""
+        self.init_schema()
+        job = self.get_ingest_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        if job["source_type"] != "server_dir":
+            raise ValueError("scan-server-dir can only be used with server_dir ingest jobs")
+        if job["status"] in {"running", "completed", "cancelled"}:
+            raise ValueError(f"cannot queue scan for {job['status']} ingest job")
+        _, cfg = self._require_domain(job["domain"])
+        docs_dir = cfg.get("docs_dir")
+        if docs_dir is None:
+            raise ValueError(f"docs_dir is not configured for domain={job['domain']!r}")
+        root = Path(docs_dir).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(str(root))
+        if batch_size is not None:
+            batch_size = max(1, min(int(batch_size), 1000))
+        summary = dict(job.get("summary") or {})
+        summary.update({"docs_dir": str(root), "limit": limit, "discovery_pending": True})
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE knowledge_ingest_jobs
+                SET status = 'pending',
+                    batch_size = COALESCE(%s, batch_size),
+                    summary = %s::jsonb,
+                    error_message = NULL,
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                [batch_size, Jsonb(to_jsonable(summary)), job_id],
+            )
+            queued = cur.fetchone()
+            conn.commit()
+        return queued
+
+    def get_ingest_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            job = cur.fetchone()
+            if not job:
+                return None
+            cur.execute(
+                """
+                SELECT id, relative_path, status, document_id, action, content_length,
+                       error_message, created_at, updated_at
+                FROM knowledge_ingest_items
+                WHERE job_id = %s
+                ORDER BY relative_path
+                LIMIT 500
+                """,
+                [job_id],
+            )
+            job["items"] = list(cur.fetchall())
+            return job
+
+    def retry_ingest_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] not in {"failed", "cancelled"}:
+                raise ValueError("only failed or cancelled ingest jobs can be retried")
+            cur.execute(
+                "UPDATE knowledge_ingest_items SET status = 'pending', error_message = NULL, updated_at = now() WHERE job_id = %s AND status IN ('failed', 'cancelled')",
+                [job_id],
+            )
+            cur.execute(
+                """
+                UPDATE knowledge_ingest_jobs
+                SET status = 'pending', retry_count = retry_count + 1,
+                    error_message = NULL, finished_at = NULL, updated_at = now()
+                WHERE id = %s
+                """,
+                [job_id],
+            )
+            self._refresh_ingest_summary(cur, job_id)
+            conn.commit()
+        return self.get_ingest_job(job_id) or {}
+
+    def cancel_ingest_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] == "completed":
+                raise ValueError("completed ingest jobs cannot be cancelled")
+            cur.execute(
+                """
+                UPDATE knowledge_ingest_jobs
+                SET status = 'cancelled', finished_at = now(), updated_at = now()
+                WHERE id = %s
+                """,
+                [job_id],
+            )
+            cur.execute(
+                "UPDATE knowledge_ingest_items SET status = 'cancelled', updated_at = now() WHERE job_id = %s AND status = 'pending'",
+                [job_id],
+            )
+            self._refresh_ingest_summary(cur, job_id)
+            conn.commit()
+        return self.get_ingest_job(job_id) or {}
+
+    def run_pending_ingest_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM knowledge_ingest_jobs
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                [max(1, limit)],
+            )
+            ids = [str(row["id"]) for row in cur.fetchall()]
+        return [self.run_ingest_job(job_id) for job_id in ids]
+
+    def run_ingest_job(self, job_id: str) -> dict[str, Any]:
+        """Register queued item content only; embedding and index derivation remain external."""
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE knowledge_ingest_jobs
+                SET status = 'running', started_at = COALESCE(started_at, now()),
+                    error_message = NULL, updated_at = now()
+                WHERE id = %s AND status IN ('pending', 'failed')
+                RETURNING *
+                """,
+                [job_id],
+            )
+            job = cur.fetchone()
+            if not job:
+                existing = self.get_ingest_job(job_id)
+                if not existing:
+                    raise KeyError(job_id)
+                return existing
+            conn.commit()
+        try:
+            if job["source_type"] == "server_dir":
+                self._discover_server_dir_items(job)
+            self._run_ingest_items(job_id, batch_size=int(job["batch_size"]))
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+                state = cur.fetchone()
+                if state and state["status"] == "cancelled":
+                    conn.commit()
+                    return self.get_ingest_job(job_id) or {}
+                cur.execute("SELECT COUNT(*) AS count FROM knowledge_ingest_items WHERE job_id = %s AND status = 'failed'", [job_id])
+                status = "failed" if cur.fetchone()["count"] else "completed"
+                cur.execute(
+                    "UPDATE knowledge_ingest_jobs SET status = %s, finished_at = now(), updated_at = now() WHERE id = %s",
+                    [status, job_id],
+                )
+                self._refresh_ingest_summary(cur, job_id)
+                conn.commit()
+            return self.get_ingest_job(job_id) or {}
+        except Exception as exc:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE knowledge_ingest_jobs SET status = 'failed', error_message = %s, finished_at = now(), updated_at = now() WHERE id = %s AND status != 'cancelled'",
+                    [str(exc)[:2000], job_id],
+                )
+                self._refresh_ingest_summary(cur, job_id)
+                conn.commit()
+            raise
+
+    def _require_domain(self, domain: str) -> tuple[str, dict[str, Any]]:
+        normalized = domain.strip().lower()
+        if not normalized:
+            raise ValueError("domain is required")
+        self.init_schema()
+        try:
+            return normalized, get_domain_config(normalized)
+        except KeyError:
+            raise ValueError(f"Unknown domain={normalized!r}") from None
+
+    @staticmethod
+    def _empty_ingest_summary(*, source_type: str, batch_size: int) -> dict[str, Any]:
+        return {
+            "operation": "register",
+            "source_type": source_type,
+            "batch_size": batch_size,
+            "indexing_triggered": False,
+            "total_items": 0,
+            "pending": 0,
+            "processing": 0,
+            "created": 0,
+            "changed": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+    def _upsert_domain_library(self, cur, domain: str, cfg: dict[str, Any], source_root: Path | None = None) -> str:
+        library_id = str(uuid.uuid4())
+        name = cfg.get("display_name") or domain
+        search_cfg = build_library_search_config(domain, cfg)
+        metadata = {"collection": cfg.get("collection"), "language": cfg.get("language"), "formal_domain": True}
+        root_text = str(source_root) if source_root is not None else None
+        source_uri = root_text or f"domain:{domain}"
+        cur.execute(
+            """
+            INSERT INTO doc_libraries (
+              id, code, name, domain, source_type, source_uri, root_path,
+              retrieval_mode, embedding_model, embedding_model_name, embedding_dim,
+              rerank_model_name, keyword_backend, qdrant_collection, opensearch_index,
+              metadata
+            )
+            VALUES (%s, %s, %s, %s, 'filesystem', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (code) DO UPDATE SET
+              name = EXCLUDED.name,
+              domain = EXCLUDED.domain,
+              source_uri = CASE WHEN EXCLUDED.root_path IS NULL THEN doc_libraries.source_uri ELSE EXCLUDED.source_uri END,
+              root_path = COALESCE(EXCLUDED.root_path, doc_libraries.root_path),
+              retrieval_mode = EXCLUDED.retrieval_mode,
+              embedding_model = EXCLUDED.embedding_model,
+              embedding_model_name = EXCLUDED.embedding_model_name,
+              embedding_dim = EXCLUDED.embedding_dim,
+              rerank_model_name = EXCLUDED.rerank_model_name,
+              keyword_backend = EXCLUDED.keyword_backend,
+              qdrant_collection = EXCLUDED.qdrant_collection,
+              opensearch_index = EXCLUDED.opensearch_index,
+              enabled = TRUE,
+              metadata = doc_libraries.metadata || EXCLUDED.metadata,
+              updated_at = now()
+            RETURNING id
+            """,
+            [
+                library_id,
+                domain,
+                name,
+                domain,
+                source_uri,
+                root_text,
+                search_cfg["retrieval_mode"],
+                search_cfg["embedding_model"],
+                search_cfg["embedding_model_name"],
+                search_cfg["embedding_dim"],
+                search_cfg["rerank_model_name"],
+                search_cfg["keyword_backend"],
+                search_cfg["qdrant_collection"],
+                search_cfg["opensearch_index"],
+                Jsonb(metadata),
+            ],
+        )
+        return cur.fetchone()["id"]
+
+    def _discover_server_dir_items(self, job: dict[str, Any]) -> None:
+        domain, cfg = self._require_domain(job["domain"])
+        summary = dict(job.get("summary") or {})
+        root = Path(summary.get("docs_dir") or cfg.get("docs_dir") or "").expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(str(root))
+        files: Iterable[Path] = iter_document_files(root)
+        limit = summary.get("limit")
+        if limit:
+            files = list(files)[: int(limit)]
+        batch_size = max(1, int(job.get("batch_size") or CODING_RAG_IMPORT_BATCH_SIZE or 100))
+        file_list = list(files)
+        with self._connect() as conn, conn.cursor() as cur:
+            self._upsert_domain_library(cur, domain, cfg, root)
+            conn.commit()
+        for start in range(0, len(file_list), batch_size):
+            with self._connect() as conn, conn.cursor() as cur:
+                for path in file_list[start : start + batch_size]:
+                    relative_path = path.relative_to(root).as_posix()
+                    cur.execute(
+                        """
+                        INSERT INTO knowledge_ingest_items (
+                          id, job_id, relative_path, source_path, status, content_length, metadata
+                        ) VALUES (%s, %s, %s, %s, 'pending', %s, %s::jsonb)
+                        ON CONFLICT (job_id, relative_path) DO NOTHING
+                        """,
+                        [
+                            str(uuid.uuid4()),
+                            job["id"],
+                            relative_path,
+                            str(path),
+                            path.stat().st_size,
+                            Jsonb({"source_type": "server_dir"}),
+                        ],
+                    )
+                self._refresh_ingest_summary(cur, str(job["id"]))
+                conn.commit()
+        with self._connect() as conn, conn.cursor() as cur:
+            summary["discovery_pending"] = False
+            summary["discovered_items"] = len(file_list)
+            cur.execute(
+                "UPDATE knowledge_ingest_jobs SET summary = summary || %s::jsonb, updated_at = now() WHERE id = %s",
+                [Jsonb(to_jsonable(summary)), job["id"]],
+            )
+            self._refresh_ingest_summary(cur, str(job["id"]))
+            conn.commit()
+
+    def _run_ingest_items(self, job_id: str, *, batch_size: int) -> None:
+        storage = create_storage(
+            CODING_RAG_STORAGE_BACKEND,
+            seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+            seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+            seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+            seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+        )
+        while True:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT status, domain, library_id FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+                job = cur.fetchone()
+                if not job or job["status"] == "cancelled":
+                    return
+                cur.execute(
+                    """
+                    SELECT id, relative_path, source_path
+                    FROM knowledge_ingest_items
+                    WHERE job_id = %s AND status = 'pending'
+                    ORDER BY created_at, relative_path
+                    LIMIT %s
+                    """,
+                    [job_id, max(1, batch_size)],
+                )
+                items = list(cur.fetchall())
+                if not items:
+                    return
+            _, cfg = self._require_domain(job["domain"])
+            for item in items:
+                try:
+                    path = Path(item["source_path"]).expanduser().resolve()
+                    if not path.is_file():
+                        raise FileNotFoundError(str(path))
+                    relative_path = validate_ingest_relative_path(item["relative_path"])
+                    metadata = inspect_ingest_document(path, relative_path, job["domain"], cfg)
+                    with self._connect() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE knowledge_ingest_items SET status = 'processing', updated_at = now() WHERE id = %s AND status = 'pending' RETURNING id",
+                            [item["id"]],
+                        )
+                        if not cur.fetchone():
+                            conn.commit()
+                            continue
+                        stored = storage.put_existing_file(path, relative_path=relative_path)
+                        action = self._upsert_document(cur, str(job["library_id"]), metadata, stored, job_id)
+                        cur.execute(
+                            """
+                            UPDATE knowledge_ingest_items
+                            SET status = 'completed', document_id = (
+                                  SELECT id FROM documents WHERE library_id = %s AND doc_key = %s
+                                ), action = %s, content_length = %s, error_message = NULL, updated_at = now()
+                            WHERE id = %s
+                            """,
+                            [job["library_id"], metadata["doc_key"], action, metadata["content_length"], item["id"]],
+                        )
+                        self._refresh_ingest_summary(cur, job_id)
+                        conn.commit()
+                except Exception as exc:
+                    with self._connect() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE knowledge_ingest_items SET status = 'failed', error_message = %s, updated_at = now() WHERE id = %s",
+                            [str(exc)[:2000], item["id"]],
+                        )
+                        self._refresh_ingest_summary(cur, job_id)
+                        conn.commit()
+
+    def _refresh_ingest_summary(self, cur, job_id: str) -> None:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS total_items,
+                   COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+                   COUNT(*) FILTER (WHERE status = 'processing')::int AS processing,
+                   COUNT(*) FILTER (WHERE action = 'created')::int AS created,
+                   COUNT(*) FILTER (WHERE action = 'changed')::int AS changed,
+                   COUNT(*) FILTER (WHERE action = 'unchanged')::int AS unchanged,
+                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+                   COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled
+            FROM knowledge_ingest_items
+            WHERE job_id = %s
+            """,
+            [job_id],
+        )
+        counts = cur.fetchone()
+        cur.execute(
+            """
+            UPDATE knowledge_ingest_jobs
+            SET summary = summary || %s::jsonb,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            [Jsonb(to_jsonable(counts)), job_id],
+        )
 
     def scan_domain(self, domain: str, *, limit: int | None = None) -> ScanResult:
         domain = domain.strip().lower()
@@ -474,6 +1063,7 @@ class DocumentRegistry:
             cur.execute(
                 f"""
                 SELECT d.*, l.code AS library_code, l.name AS library_name,
+                       l.source_type AS library_source_type,
                        l.retrieval_mode AS library_retrieval_mode,
                        l.embedding_model AS library_embedding_model,
                        l.embedding_model_name AS library_embedding_model_name,
@@ -498,6 +1088,7 @@ class DocumentRegistry:
             cur.execute(
                 """
                 SELECT d.*, l.code AS library_code, l.name AS library_name,
+                       l.source_type AS library_source_type,
                        l.retrieval_mode AS library_retrieval_mode,
                        l.embedding_model AS library_embedding_model,
                        l.embedding_model_name AS library_embedding_model_name,
@@ -528,6 +1119,60 @@ class DocumentRegistry:
             )
             doc["versions"] = list(cur.fetchall())
             return doc
+
+    def get_library(self, library_id: str) -> dict[str, Any] | None:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM doc_libraries WHERE id = %s", [library_id])
+            library = cur.fetchone()
+            if not library:
+                return None
+            cur.execute(
+                """
+                SELECT id, domain, title, status, indexed_at, chunk_count
+                FROM documents
+                WHERE library_id = %s AND deleted_at IS NULL
+                ORDER BY created_at
+                """,
+                [library_id],
+            )
+            library["documents"] = list(cur.fetchall())
+            return library
+
+    def soft_delete_imported_library(self, library_id: str) -> dict[str, Any]:
+        """Hide an imported library and its documents while retaining version storage."""
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, code, source_type FROM doc_libraries WHERE id = %s", [library_id])
+            library = cur.fetchone()
+            if not library:
+                raise KeyError(library_id)
+            if library["source_type"] != "archive":
+                raise ValueError("Only imported archive libraries can be deleted through this endpoint")
+            cur.execute(
+                """
+                UPDATE documents
+                SET enabled = FALSE, status = 'deleted', deleted_at = now(),
+                    indexed_at = NULL, chunk_count = 0, index_required = FALSE,
+                    error_message = NULL, updated_at = now()
+                WHERE library_id = %s AND deleted_at IS NULL
+                RETURNING id
+                """,
+                [library_id],
+            )
+            document_ids = [str(row["id"]) for row in cur.fetchall()]
+            cur.execute(
+                "UPDATE doc_libraries SET enabled = FALSE, updated_at = now() WHERE id = %s",
+                [library_id],
+            )
+            conn.commit()
+        return {
+            "deleted": True,
+            "library_id": library_id,
+            "library_code": library["code"],
+            "document_ids": document_ids,
+            "retained_versions": True,
+        }
 
     def list_index_jobs(
         self,
@@ -1635,6 +2280,35 @@ def iter_document_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+def validate_ingest_relative_path(value: str) -> str:
+    """Normalize browser directory upload paths while rejecting traversal."""
+    if not value or "\x00" in value:
+        raise ValueError("relative_path is required")
+    normalized = value.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise ValueError(f"unsafe relative_path: {value}")
+    return path.as_posix()
+
+
+def inspect_ingest_document(path: Path, relative_path: str, domain: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    content = path.read_text(encoding="utf-8", errors="replace")
+    content_bytes = content.encode("utf-8")
+    return {
+        "domain": domain,
+        "doc_key": f"{domain}:{relative_path}",
+        "title": derive_title(content, Path(relative_path)),
+        "source_file": relative_path,
+        "local_path": str(path.resolve()),
+        "relative_path": relative_path,
+        "mime_type": mimetypes.guess_type(relative_path)[0] or "text/plain",
+        "language": cfg.get("language"),
+        "content_hash": hashlib.sha256(content_bytes).hexdigest(),
+        "content_length": len(content_bytes),
+        "metadata": {"suffix": Path(relative_path).suffix.lower(), "ingest": "registration-only"},
+    }
+
+
 def inspect_document(path: Path, root: Path, domain: str, cfg: dict[str, Any]) -> dict[str, Any]:
     content = path.read_text(encoding="utf-8", errors="replace")
     relative_path = path.relative_to(root).as_posix()
@@ -1969,4 +2643,48 @@ CREATE TABLE IF NOT EXISTS query_expansions (
     UNIQUE(domain, source_term)
 );
 CREATE INDEX IF NOT EXISTS idx_query_expansions_domain ON query_expansions(domain) WHERE enabled;
+"""
+
+INGEST_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS knowledge_ingest_jobs (
+    id UUID PRIMARY KEY,
+    domain TEXT NOT NULL,
+    library_id UUID NOT NULL REFERENCES doc_libraries(id),
+    source_type TEXT NOT NULL,
+    operation TEXT NOT NULL DEFAULT 'register',
+    status TEXT NOT NULL DEFAULT 'accepting',
+    batch_size INTEGER NOT NULL DEFAULT 100,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    CHECK (source_type IN ('upload', 'server_dir')),
+    CHECK (operation = 'register'),
+    CHECK (status IN ('accepting', 'pending', 'running', 'completed', 'failed', 'cancelled'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_jobs_domain ON knowledge_ingest_jobs(domain);
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_jobs_status ON knowledge_ingest_jobs(status);
+
+CREATE TABLE IF NOT EXISTS knowledge_ingest_items (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES knowledge_ingest_jobs(id),
+    relative_path TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    document_id UUID REFERENCES documents(id),
+    action TEXT,
+    content_length INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(job_id, relative_path),
+    CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+    CHECK (action IS NULL OR action IN ('created', 'changed', 'unchanged'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_job_id ON knowledge_ingest_items(job_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_status ON knowledge_ingest_items(status);
 """

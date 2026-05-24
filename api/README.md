@@ -60,6 +60,36 @@ CODING_RAG_DOMAIN=harmonyos python3 -m uvicorn api.app:app --host 0.0.0.0 --port
 
 健康检查，返回服务状态和可用领域列表。
 
+### Knowledge base ingest (registration-only)
+
+正式 `domain` 是知识库入口，主 library 使用相同 code。导入作业只登记原文、
+版本和 `index_required=true` 状态，不自动触发 embedding 或 reindex。
+
+- `GET /api/knowledge-bases`：返回 domain、主 library、文档计数和最近 ingest job。
+- `GET /api/knowledge-bases/{domain}/documents`：返回指定 domain 的登记文档。
+- `POST /api/knowledge-bases/{domain}/ingest-jobs`：创建任务，请求体为
+  `{"source_type":"upload","batch_size":100}` 或 `{"source_type":"server_dir"}`。
+- `POST /api/ingest-jobs/{id}/files`：以 multipart 提交重复 `files` 字段，并可提交
+  一一对应的重复 `relative_paths` 字段以保留浏览器 `webkitRelativePath`；上传任务
+  可分多批提交，并在此阶段保持 `accepting`，`summary` 会反映已接收文件数。
+- `POST /api/ingest-jobs/{id}/complete`：完成 browser 多文件/目录上传；至少已有一个
+  staged item 时将 upload 任务从 `accepting` 改为 `pending`，此后拒绝继续上传。
+- `POST /api/ingest-jobs/{id}/scan-server-dir`：对配置的 `docs_dir` 入队，可选体
+  `{"limit":10,"batch_size":100}`；发现和登记由 worker 分批完成。
+- `GET /api/ingest-jobs/{id}`、`POST /api/ingest-jobs/{id}/retry`、
+  `POST /api/ingest-jobs/{id}/cancel`：查询和控制任务。
+
+相对路径必须是安全的非绝对路径；包含 `..`、空段或越界路径的上传会被拒绝。
+upload 任务只有在显式调用 `complete` 后才会被 worker 消费；`server_dir` 任务仍由
+`scan-server-dir` 直接排队。
+运行作业：
+
+```bash
+python3 scripts/library_import_worker.py --once --ingest-only
+# 或仅执行一个任务
+python3 scripts/library_import_worker.py --ingest-job-id <job-id>
+```
+
 ## Smoke Test
 
 ```bash

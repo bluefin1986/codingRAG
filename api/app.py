@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,11 +38,19 @@ from config import (
 )
 
 from api.engine import DomainQueryEngine  # noqa: E402
-from api.registry import DocumentRegistry, RegistryUnavailable, domain_cache, query_expansion_cache  # noqa: E402
+from api.registry import (  # noqa: E402
+    DocumentRegistry,
+    IngestStateConflict,
+    RegistryUnavailable,
+    domain_cache,
+    query_expansion_cache,
+)
 from indexer.per_doc_indexer import DocumentDisabled, DocumentNotFound, PerDocumentIndexer  # noqa: E402
 from api.schemas import (  # noqa: E402
     LibraryExportRequest,
     LibraryImportRequest,
+    IngestJobCreateRequest,
+    IngestServerDirRequest,
     DomainItem,
     DomainRequest,
     RagQueryRequest,
@@ -219,6 +227,45 @@ def delete_domain(domain_key: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete domain: {e}")
 
 
+@app.post("/api/domains/{domain_key}/reindex-all")
+def reindex_all_docs(domain_key: str):
+    """Mark all enabled documents in a domain for reindex and run full reindex."""
+    normalized = domain_key.strip().lower()
+    try:
+        _get_registry().init_schema()
+        domain_item = next((d for d in domain_cache.list_domains() if d["domain_key"] == normalized), None)
+        if domain_item is None:
+            raise HTTPException(status_code=404, detail=f"Unknown domain={domain_key!r}")
+        with _get_registry()._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET index_required = TRUE, updated_at = now()
+                WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
+                """,
+                [normalized],
+            )
+            marked = cur.rowcount
+            conn.commit()
+        indexer = PerDocumentIndexer()
+        result = indexer.reindex_changed(normalized)
+        return {
+            "domain": normalized,
+            "marked_for_reindex": marked,
+            "total": result.get("total", 0),
+            "indexed": result.get("indexed", 0),
+            "failed": result.get("failed", 0),
+            "failures": result.get("failures", []),
+        }
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("reindex_all_docs failed for domain=%s", normalized)
+        raise HTTPException(status_code=500, detail=f"Failed to reindex all docs: {e}")
+
+
 @app.get("/api/libraries")
 def list_libraries():
     try:
@@ -228,6 +275,171 @@ def list_libraries():
     except Exception as e:
         logger.exception("list_libraries failed")
         raise HTTPException(status_code=500, detail=f"Failed to list libraries: {e}")
+
+
+@app.get("/api/knowledge-bases")
+def list_knowledge_bases():
+    """List formal domains with primary library/document and latest ingest state."""
+    try:
+        return {"items": _get_registry().list_knowledge_bases()}
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_knowledge_bases failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list knowledge bases: {e}")
+
+
+@app.get("/api/knowledge-bases/{domain}/documents")
+def list_knowledge_base_documents(
+    domain: str,
+    status: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        return _get_registry().list_knowledge_base_documents(
+            domain,
+            status=status,
+            q=q,
+            limit=limit,
+            offset=offset,
+        )
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("list_knowledge_base_documents failed for domain=%s", domain)
+        raise HTTPException(status_code=500, detail=f"Failed to list knowledge base documents: {e}")
+
+
+@app.post("/api/knowledge-bases/{domain}/ingest-jobs")
+def create_ingest_job(domain: str, req: Optional[IngestJobCreateRequest] = None):
+    """Create an asynchronous registration-only ingest job for one formal domain."""
+    req = req or IngestJobCreateRequest()
+    try:
+        return _get_registry().create_ingest_job(domain, source_type=req.source_type, batch_size=req.batch_size)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("create_ingest_job failed for domain=%s", domain)
+        raise HTTPException(status_code=500, detail=f"Failed to create ingest job: {e}")
+
+
+@app.post("/api/ingest-jobs/{job_id}/files")
+async def upload_ingest_files(
+    job_id: str,
+    files: List[UploadFile] = File(..., description="Uploaded text documents."),
+    # FastAPI 0.111 extracts repeated form parts as a list only with a non-Optional list annotation.
+    relative_paths: List[str] = Form(
+        None,
+        description="Relative paths paired with files, including browser webkitRelativePath values.",
+    ),
+):
+    """Stage one upload batch; complete the job separately to allow registration."""
+    if relative_paths is not None and len(relative_paths) != len(files):
+        raise HTTPException(status_code=400, detail="relative_paths count must match files count")
+    payload: list[tuple[str, bytes]] = []
+    for index, file in enumerate(files):
+        relative_path = relative_paths[index] if relative_paths is not None else (file.filename or "")
+        payload.append((relative_path, await file.read()))
+    try:
+        return _get_registry().stage_ingest_files(job_id, payload)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except IngestStateConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("upload_ingest_files failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to queue ingest files: {e}")
+
+
+@app.post("/api/ingest-jobs/{job_id}/complete")
+def complete_ingest_upload(job_id: str):
+    """Finalize a browser upload job so the ingest worker can consume it."""
+    try:
+        return _get_registry().complete_ingest_upload(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except IngestStateConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("complete_ingest_upload failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to complete ingest upload: {e}")
+
+
+@app.post("/api/ingest-jobs/{job_id}/scan-server-dir")
+def scan_ingest_server_dir(job_id: str, req: Optional[IngestServerDirRequest] = None):
+    """Queue discovery from the domain's configured docs_dir for the ingest worker."""
+    req = req or IngestServerDirRequest()
+    try:
+        return _get_registry().queue_server_dir_ingest(job_id, limit=req.limit, batch_size=req.batch_size)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("scan_ingest_server_dir failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to queue server directory ingest: {e}")
+
+
+@app.get("/api/ingest-jobs/{job_id}")
+def get_ingest_job(job_id: str):
+    try:
+        job = _get_registry().get_ingest_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("get_ingest_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get ingest job: {e}")
+    if not job:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    return job
+
+
+@app.post("/api/ingest-jobs/{job_id}/retry")
+def retry_ingest_job(job_id: str):
+    try:
+        return _get_registry().retry_ingest_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("retry_ingest_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to retry ingest job: {e}")
+
+
+@app.post("/api/ingest-jobs/{job_id}/cancel")
+def cancel_ingest_job(job_id: str):
+    try:
+        return _get_registry().cancel_ingest_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("cancel_ingest_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to cancel ingest job: {e}")
 
 
 @app.get("/api/query-expansions", response_model=list[QueryExpansionItem])
@@ -519,6 +731,32 @@ def export_library(library_id: str, req: Optional[LibraryExportRequest] = None):
     except Exception as e:
         logger.exception("export_library failed for library_id=%s", library_id)
         raise HTTPException(status_code=500, detail=f"Failed to export library: {e}")
+
+
+@app.delete("/api/libraries/{library_id}")
+def delete_library(library_id: str):
+    """Soft-delete an imported library after removing its derived indexes."""
+    try:
+        registry = _get_registry()
+        library = registry.get_library(library_id)
+        if not library:
+            raise HTTPException(status_code=404, detail="Library not found")
+        if library["source_type"] != "archive":
+            raise HTTPException(status_code=409, detail="Only imported archive libraries can be deleted")
+        for document in library["documents"]:
+            PerDocumentIndexer().delete_document_index(str(document["id"]))
+        return registry.soft_delete_imported_library(library_id)
+    except HTTPException:
+        raise
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Library not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("delete_library failed for library_id=%s", library_id)
+        raise HTTPException(status_code=502, detail=f"Failed to delete imported library: {e}")
 
 
 @app.post("/api/libraries/import/preview")

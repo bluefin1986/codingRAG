@@ -1,7 +1,7 @@
 """Pydantic schemas for codingRAG HTTP API."""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -93,6 +93,23 @@ class LibraryImportRequest(BaseModel):
     mode: Optional[str] = Field(None, description="skip / upsert / replace-library / rename-library")
     new_library_code: Optional[str] = Field(None, description="Target library code for rename-library imports")
     async_import: bool = Field(True, alias="async", description="Enqueue actual imports as async jobs by default")
+
+
+class IngestJobCreateRequest(BaseModel):
+    """POST /api/knowledge-bases/{domain}/ingest-jobs request body."""
+
+    source_type: Literal["files", "directory", "server_dir", "upload"] = Field(
+        "files",
+        description="Input source selected for this registration-only job. 'upload' is a legacy alias for 'files'.",
+    )
+    batch_size: int = Field(100, ge=1, le=1000, description="Number of items processed per worker batch.")
+
+
+class IngestServerDirRequest(BaseModel):
+    """POST /api/ingest-jobs/{job_id}/scan-server-dir request body."""
+
+    limit: Optional[int] = Field(None, ge=1, le=10000, description="Optional sample-scan safety limit.")
+    batch_size: Optional[int] = Field(None, ge=1, le=1000, description="Override this job's batch size.")
 
 
 class QueryExpansionRequest(BaseModel):
