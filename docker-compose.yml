@@ -64,6 +64,36 @@ services:
       - seaweedfs-filer
     restart: unless-stopped
 
+  reindex-worker:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
+        NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
+    image: ${CODINGRAG_IMAGE:-codingrag:latest}
+    container_name: ${CODINGRAG_REINDEX_WORKER_CONTAINER_NAME:-codingrag-reindex-worker}
+    command: python3 scripts/reindex_worker.py
+    environment:
+      CODING_RAG_DATABASE_URL: ${CODING_RAG_DATABASE_URL:-postgresql://codingrag:codingrag@postgres:5432/codingrag}
+      CODING_RAG_AIMODELS_API_BASE: ${CODING_RAG_AIMODELS_API_BASE:-http://10.63.3.80:8030}
+      CODING_RAG_QDRANT_HOST: qdrant
+      CODING_RAG_QDRANT_PORT: "6333"
+      CODING_RAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-codingrag-qdrant-secret}
+      CODING_RAG_KEYWORD_BACKEND: ${CODING_RAG_KEYWORD_BACKEND:-opensearch}
+      CODING_RAG_ES_URL: ${CODING_RAG_ES_URL:-http://opensearch:9200}
+      CODING_RAG_ES_API_KEY: ${CODING_RAG_ES_API_KEY:-}
+      CODING_RAG_STORAGE_BACKEND: ${CODING_RAG_STORAGE_BACKEND:-seaweedfs}
+      CODING_RAG_SEAWEEDFS_FILER_URL: ${CODING_RAG_SEAWEEDFS_FILER_URL:-http://seaweedfs-filer:8888}
+    depends_on:
+      - postgres
+      - qdrant
+      - opensearch
+      - seaweedfs-filer
+    restart: unless-stopped
+
   postgres:
     platform: linux/amd64
     image: ${POSTGRES_IMAGE:-postgres:16-alpine}
