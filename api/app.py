@@ -893,6 +893,7 @@ def rag_query(req: RagQueryRequest):
             category=req.category,
             has_code=req.hasCode,
             method=req.method,
+            rerank=req.rerank,
             debug=req.debug,
         )
     except Exception as e:

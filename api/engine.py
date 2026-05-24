@@ -739,6 +739,7 @@ class DomainQueryEngine:
         category: Optional[str] = None,
         has_code: Optional[bool] = None,
         method: str = "hybrid",
+        rerank: bool = True,
         debug: bool = False,
     ) -> tuple[List[dict], Optional[dict]]:
         """Execute search and return (results, trace_dict_or_None).
@@ -746,6 +747,10 @@ class DomainQueryEngine:
         When debug=True, trace_dict contains per-stage snapshots.
         When debug=False, trace_dict is None and behavior is unchanged.
         """
+        if method in ("rerank", "hybrid_rerank"):
+            method = "hybrid"
+            rerank = True
+
         trace: Optional[dict] = None
         if debug:
             symbols_list = _extract_technical_symbols_simple(query)
@@ -760,10 +765,11 @@ class DomainQueryEngine:
             }
 
         logger.info(
-            "RAG_SEARCH_START domain=%s collection=%s method=%s top_k=%s category=%s has_code=%s query=%r debug=%s",
+            "RAG_SEARCH_START domain=%s collection=%s method=%s rerank=%s top_k=%s category=%s has_code=%s query=%r debug=%s",
             self.domain,
             self.collection,
             method,
+            rerank,
             top_k,
             category,
             has_code,
@@ -772,11 +778,11 @@ class DomainQueryEngine:
         )
 
         if method == "semantic":
-            candidate_k = max(top_k * 20, 100) if _extract_technical_symbols_simple(query) else top_k
+            symbols = _extract_technical_symbols_simple(query)
+            candidate_k = top_k * 20 if rerank else (max(top_k * 20, 100) if symbols else top_k)
             results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("semantic_score")
-            symbols = _extract_technical_symbols_simple(query)
             if symbols:
                 for r in results:
                     matches = _technical_symbol_match_count(r, symbols)
@@ -784,13 +790,19 @@ class DomainQueryEngine:
                         r["symbol_matches"] = matches
                         r["score"] = float(r.get("score", 0.0) or 0.0) + matches * 2.0
                 results.sort(key=lambda r: float(r.get("score", 0.0) or 0.0), reverse=True)
-            results = results[:top_k]
-            self._log_stage("semantic", results)
-            if trace:
-                trace["final"] = self._snapshot_stage(results)
-            return results, trace
+            if rerank:
+                self._log_stage("semantic_candidates", results)
+                if trace:
+                    trace["semantic_candidates"] = self._snapshot_stage(results)
+                candidates = results
+            else:
+                results = results[:top_k]
+                self._log_stage("semantic", results)
+                if trace:
+                    trace["final"] = self._snapshot_stage(results)
+                return results, trace
 
-        if method == "bm25":
+        elif method == "bm25":
             # When debug, use expanded query for BM25
             bm25_query = query
             if debug and trace:
@@ -798,93 +810,101 @@ class DomainQueryEngine:
             elif not debug:
                 # Even without debug, use expanded query for BM25 (non-breaking improvement)
                 bm25_query, _ = expand_query(query, self.domain)
-            results = self.bm25_search(bm25_query, top_k=top_k, category=category, has_code=has_code)
+            candidate_k = top_k * 20 if rerank else top_k
+            results = self.bm25_search(bm25_query, top_k=candidate_k, category=category, has_code=has_code)
             for r in results:
                 r["score"] = r.pop("bm25_score")
-            self._log_stage("bm25", results)
-            if trace:
-                trace["final"] = self._snapshot_stage(results)
-            return results, trace
+            if rerank:
+                self._log_stage("bm25_candidates", results)
+                if trace:
+                    trace["bm25_candidates"] = self._snapshot_stage(results)
+                candidates = results
+            else:
+                self._log_stage("bm25", results)
+                if trace:
+                    trace["final"] = self._snapshot_stage(results)
+                return results, trace
 
-        # hybrid or rerank: run both, fuse, then optionally rerank.
-        # When debug, use expanded query for BM25.
-        expanded_bm25_query, _ = expand_query(query, self.domain)
-        bm25_query = expanded_bm25_query if (expanded_bm25_query != query) else query
-
-        candidate_k = max(top_k * 40, 200) if method in ("rerank", "hybrid_rerank") else max(top_k * 4, 20)
-        sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
-        bm25_results = self.bm25_search(bm25_query, top_k=candidate_k, category=category, has_code=has_code)
-        bm25_meta = {
-            _result_key(r): {"bm25_rank": rank, "bm25_score": r.get("bm25_score", 0.0)}
-            for rank, r in enumerate(bm25_results, 1)
-        }
-        self._log_stage("semantic_candidates", sem_results)
-        self._log_stage("bm25_candidates", bm25_results)
-        if trace:
-            trace["semantic_candidates"] = self._snapshot_stage(sem_results)
-            trace["bm25_candidates"] = self._snapshot_stage(bm25_results)
-
-        if not bm25_results:
-            fused = []
-            for r in sem_results[:candidate_k]:
-                item = r.copy()
-                item["score"] = item.pop("semantic_score", item.get("score", 0.0))
-                fused.append(item)
         else:
-            fused = rrf_fuse(
-                semantic_results=sem_results,
-                bm25_results=bm25_results,
-                k=30,
-                semantic_weight=1.0,
-                bm25_weight=self.bm25_weight,
-                top_k=candidate_k,
-                bm25_only_boost=1.0,
-            )
-            fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
-            # Build symbol_weights from known_identifiers for weighted boost
-            symbol_weights = self._build_symbol_weights()
-            fused = identifier_boost(fused, query, boost_per_match=1.0, symbol_weights=symbol_weights)
-            fused = _protect_symbol_bm25_hits(fused, bm25_results, query, limit=max(top_k, 8))
-        for item in fused:
-            item.update(bm25_meta.get(_result_key(item), {}))
-        self._log_stage("fusion", fused)
-        if trace:
-            trace["fusion"] = self._snapshot_stage(fused)
+            # Hybrid runs both recall paths, fuses them, and optionally reranks.
+            expanded_bm25_query, _ = expand_query(query, self.domain)
+            bm25_query = expanded_bm25_query if (expanded_bm25_query != query) else query
 
-        if method in ("rerank", "hybrid_rerank"):
-            is_comparison = _is_comparison_query(query)
-            reranked = rerank_results(
-                query,
-                fused,
-                top_k=max(top_k * 3, 15),
-                api_base=self.rerank_api_base,
-                model_name=self.rerank_model_name,
-            )
-            keyword_searcher, _ = _load_keyword_searcher_for_domain(self.cfg)
-            bm25 = getattr(keyword_searcher, "_bm25", None) if keyword_searcher is not None else None
-            if bm25 is not None and not _is_explanatory_query(query) and not is_comparison:
-                reranked = _field_match_rerank(reranked, query, bm25)
-            # Always filter obvious noise regardless of query type.
-            reranked = _drop_obvious_noise(reranked, query)
-            # Deduplicate by source_file
-            seen_sources: set[str] = set()
-            deduped: list[dict] = []
-            for r in reranked:
-                src = r.get("source_file", "")
-                if src not in seen_sources:
-                    seen_sources.add(src)
-                    deduped.append(r)
-            reranked = deduped[:top_k]
-            self._log_stage("rerank", reranked)
+            candidate_k = max(top_k * 40, 200) if rerank else max(top_k * 4, 20)
+            sem_results = self.semantic_search(query, top_k=candidate_k, category=category, has_code=has_code)
+            bm25_results = self.bm25_search(bm25_query, top_k=candidate_k, category=category, has_code=has_code)
+            bm25_meta = {
+                _result_key(r): {"bm25_rank": rank, "bm25_score": r.get("bm25_score", 0.0)}
+                for rank, r in enumerate(bm25_results, 1)
+            }
+            self._log_stage("semantic_candidates", sem_results)
+            self._log_stage("bm25_candidates", bm25_results)
             if trace:
-                trace["rerank"] = self._snapshot_stage(reranked)
-                trace["final"] = self._snapshot_stage(reranked)
-            return reranked, trace
+                trace["semantic_candidates"] = self._snapshot_stage(sem_results)
+                trace["bm25_candidates"] = self._snapshot_stage(bm25_results)
 
-        final_results = fused[:top_k]
+            if not bm25_results:
+                fused = []
+                for r in sem_results[:candidate_k]:
+                    item = r.copy()
+                    item["score"] = item.pop("semantic_score", item.get("score", 0.0))
+                    fused.append(item)
+            else:
+                fused = rrf_fuse(
+                    semantic_results=sem_results,
+                    bm25_results=bm25_results,
+                    k=30,
+                    semantic_weight=1.0,
+                    bm25_weight=self.bm25_weight,
+                    top_k=candidate_k,
+                    bm25_only_boost=1.0,
+                )
+                fused = path_boost(fused, query, boost_per_match=self.path_boost_per_match)
+                # Build symbol_weights from known_identifiers for weighted boost
+                symbol_weights = self._build_symbol_weights()
+                fused = identifier_boost(fused, query, boost_per_match=1.0, symbol_weights=symbol_weights)
+                fused = _protect_symbol_bm25_hits(fused, bm25_results, query, limit=max(top_k, 8))
+            for item in fused:
+                item.update(bm25_meta.get(_result_key(item), {}))
+            self._log_stage("fusion", fused)
+            if trace:
+                trace["fusion"] = self._snapshot_stage(fused)
+
+            if not rerank:
+                final_results = fused[:top_k]
+                if trace:
+                    trace["final"] = self._snapshot_stage(final_results)
+                return final_results, trace
+            candidates = fused
+
+        is_comparison = _is_comparison_query(query)
+        reranked = rerank_results(
+            query,
+            candidates,
+            top_k=max(top_k * 3, 15),
+            api_base=self.rerank_api_base,
+            model_name=self.rerank_model_name,
+        )
+        keyword_searcher, _ = _load_keyword_searcher_for_domain(self.cfg)
+        bm25 = getattr(keyword_searcher, "_bm25", None) if keyword_searcher is not None else None
+        if bm25 is not None and not _is_explanatory_query(query) and not is_comparison:
+            reranked = _field_match_rerank(reranked, query, bm25)
+        # Always filter obvious noise regardless of query type.
+        reranked = _drop_obvious_noise(reranked, query)
+        # Deduplicate by source_file
+        seen_sources: set[str] = set()
+        deduped: list[dict] = []
+        for r in reranked:
+            src = r.get("source_file", "")
+            if src not in seen_sources:
+                seen_sources.add(src)
+                deduped.append(r)
+        reranked = deduped[:top_k]
+        self._log_stage("rerank", reranked)
         if trace:
-            trace["final"] = self._snapshot_stage(final_results)
-        return final_results, trace
+            trace["rerank"] = self._snapshot_stage(reranked)
+            trace["final"] = self._snapshot_stage(reranked)
+        return reranked, trace
 
     def _build_symbol_weights(self) -> Dict[str, float]:
         """Build a symbol→weight mapping from domain's known_identifiers config."""
@@ -911,10 +931,12 @@ class DomainQueryEngine:
         category: Optional[str] = None,
         has_code: Optional[bool] = None,
         method: str = "hybrid",
+        rerank: bool = True,
         debug: bool = False,
     ) -> dict:
         results, trace = self.search(
-            question, top_k=top_k, category=category, has_code=has_code, method=method, debug=debug,
+            question, top_k=top_k, category=category, has_code=has_code,
+            method=method, rerank=rerank, debug=debug,
         )
         results = _expand_result_context(results, self.cfg)
         context = format_context(results)

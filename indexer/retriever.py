@@ -331,26 +331,35 @@ def search(
     category: Optional[str] = None,
     has_code: Optional[bool] = None,
     method: str = "hybrid",
+    rerank: bool = True,
 ) -> List[dict]:
     """
     混合检索。
 
     method:
-        "hybrid"    - BM25 + 语义 RRF 融合 + 路径加权（默认，推荐）
+        "hybrid"    - BM25 + 语义 RRF 融合 + 路径加权
         "semantic"  - 纯语义
         "bm25"      - 纯 BM25
-        "rerank"    - hybrid 后调用当前 domain 对应 rerank 模型重排
+    rerank:
+        是否在召回后调用当前 domain 对应 rerank 模型重排（默认启用）
     """
+    if method in ("rerank", "hybrid_rerank"):
+        method = "hybrid"
+        rerank = True
+
     if method == "semantic":
-        return _semantic_only(query, top_k, category, has_code)
+        candidates = _semantic_only(query, top_k * 20 if rerank else top_k, category, has_code)
     elif method == "bm25":
-        return _bm25_only(query, top_k)
-    elif method in ("rerank", "hybrid_rerank"):
+        candidates = _bm25_only(query, top_k * 20 if rerank else top_k)
+    elif rerank:
         # Keep a wider first-stage pool so exact API docs are not dropped before rerank.
         candidates = _hybrid_search(query, max(top_k * 40, 200), category, has_code)
-        return rerank_results(query, candidates, top_k=top_k)
     else:
         return _hybrid_search(query, top_k, category, has_code)
+
+    if rerank:
+        return rerank_results(query, candidates, top_k=top_k)
+    return candidates[:top_k]
 
 
 def _semantic_only(query, top_k, category, has_code) -> List[dict]:
@@ -482,10 +491,14 @@ def rag_query(
     category: Optional[str] = None,
     has_code: Optional[bool] = None,
     method: str = "hybrid",
+    rerank: bool = True,
 ) -> dict:
     """RAG 查询：检索 + 构建 prompt。"""
     cfg = _active_config()
-    results = search(question, top_k=top_k, category=category, has_code=has_code, method=method)
+    results = search(
+        question, top_k=top_k, category=category, has_code=has_code,
+        method=method, rerank=rerank,
+    )
     context = format_context(results)
 
     prompt = f"""你是{cfg["prompt_role"]}。基于以下参考文档回答用户问题。
