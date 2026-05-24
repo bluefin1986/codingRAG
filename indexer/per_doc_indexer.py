@@ -74,6 +74,10 @@ class PerDocumentIndexer:
                 """
                 SELECT d.*, d.version AS document_version,
                        l.code AS library_code, l.qdrant_collection,
+                       l.embedding_model AS library_embedding_model,
+                       l.embedding_model_name AS library_embedding_model_name,
+                       l.embedding_dim AS library_embedding_dim,
+                       l.rerank_model_name AS library_rerank_model_name,
                        l.keyword_backend AS library_keyword_backend,
                        l.opensearch_index AS library_opensearch_index,
                        dv.storage_backend, dv.storage_bucket, dv.storage_key,
@@ -141,7 +145,23 @@ class PerDocumentIndexer:
     @staticmethod
     def _domain_config(document: dict[str, Any]) -> dict[str, Any]:
         domain = str(document["domain"]).strip().lower()
-        return get_domain_config(domain)
+        try:
+            return get_domain_config(domain)
+        except KeyError:
+            collection = str(document.get("qdrant_collection") or "").strip()
+            embedding_model_name = str(document.get("library_embedding_model_name") or "").strip()
+            embedding_dim = document.get("library_embedding_dim")
+            if not collection or not embedding_model_name or not embedding_dim:
+                raise
+            return {
+                "domain": domain,
+                "collection": collection,
+                "embedding_model": document.get("library_embedding_model") or "BAAI/bge-m3",
+                "embedding_model_name": embedding_model_name,
+                "embedding_dim": int(embedding_dim),
+                "rerank_model_name": document.get("library_rerank_model_name") or "bge-reranker-base",
+                "noise_patterns": [],
+            }
 
     @staticmethod
     def _collection(document: dict[str, Any], cfg: dict[str, Any]) -> str:
@@ -372,6 +392,56 @@ class PerDocumentIndexer:
             "collection": collection,
             "status": "deleted-index",
             "index_required": bool(document["enabled"]),
+        }
+
+    def list_document_chunks(
+        self,
+        doc_id: str,
+        *,
+        limit: int = 50,
+        offset: str | None = None,
+    ) -> dict[str, Any]:
+        """Read the current indexed chunk payloads for one document from Qdrant."""
+        document = self._load_document(doc_id)
+        collection = str(document.get("qdrant_collection") or "").strip()
+        if not collection:
+            cfg = self._domain_config(document)
+            collection = self._collection(document, cfg)
+        request: dict[str, Any] = {
+            "filter": {"must": [{"key": "doc_id", "match": {"value": doc_id}}]},
+            "limit": max(1, min(limit, 200)),
+            "with_payload": True,
+            "with_vector": False,
+        }
+        if offset:
+            request["offset"] = offset
+
+        with self._qdrant_client() as client:
+            response = client.post(f"/collections/{collection}/points/scroll", json=request)
+            if response.status_code == 404:
+                points: list[dict[str, Any]] = []
+                next_offset = None
+            else:
+                response.raise_for_status()
+                result = response.json().get("result") or {}
+                points = result.get("points") or []
+                next_offset = result.get("next_page_offset")
+
+        items = []
+        for point in points:
+            item = dict(point.get("payload") or {})
+            item["point_id"] = str(point.get("id") or item.get("chunk_id") or "")
+            items.append(item)
+        items.sort(key=lambda item: int(item.get("chunk_index", 0)))
+        return {
+            "document_id": doc_id,
+            "domain": document["domain"],
+            "collection": collection,
+            "total": int(document.get("chunk_count") or 0),
+            "limit": request["limit"],
+            "offset": offset,
+            "next_offset": next_offset,
+            "items": items,
         }
 
     def reindex_changed(self, domain: str) -> dict[str, Any]:

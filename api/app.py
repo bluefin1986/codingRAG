@@ -360,6 +360,19 @@ def reindex_doc(document_id: str):
         raise HTTPException(status_code=502, detail=f"Failed to reindex document: {e}")
 
 
+@app.delete("/api/docs/{document_id}/index")
+def delete_doc_index(document_id: str):
+    try:
+        return PerDocumentIndexer().delete_document_index(document_id)
+    except DocumentNotFound:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("delete_doc_index failed for document_id=%s", document_id)
+        raise HTTPException(status_code=502, detail=f"Failed to delete document index: {e}")
+
+
 @app.get("/api/docs/{document_id}")
 def get_doc(document_id: str):
     try:
@@ -388,6 +401,23 @@ def get_doc_content(document_id: str, version: Optional[int] = Query(None, ge=1)
     if not content:
         raise HTTPException(status_code=404, detail="Document/version not found")
     return content
+
+
+@app.get("/api/docs/{document_id}/chunks")
+def list_doc_chunks(
+    document_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: Optional[str] = Query(None, description="Qdrant scroll offset returned by next_offset"),
+):
+    try:
+        return PerDocumentIndexer().list_document_chunks(document_id, limit=limit, offset=offset)
+    except DocumentNotFound:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_doc_chunks failed for document_id=%s", document_id)
+        raise HTTPException(status_code=502, detail=f"Failed to list document chunks: {e}")
 
 
 @app.put("/api/docs/{document_id}/content")
@@ -532,6 +562,23 @@ def get_library_transfer_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Transfer job not found")
     return job
+
+
+@app.get("/api/index/jobs")
+def list_index_jobs(
+    domain: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List latest per-document index states; this is not historical job logging."""
+    try:
+        return _get_registry().list_index_jobs(domain=domain, status=status, limit=limit, offset=offset)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_index_jobs failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list index jobs: {e}")
 
 
 @app.post("/api/libraries/{library_id}/retention/preview")

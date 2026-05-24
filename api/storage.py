@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
@@ -41,13 +42,25 @@ class ObjectStorage:
 class LocalObjectStorage(ObjectStorage):
     backend = "local"
 
+    def __init__(self, root_dir: str = "") -> None:
+        default_root = Path(__file__).resolve().parents[1] / "data" / "originals"
+        self.root_dir = Path(root_dir or os.getenv("CODING_RAG_LOCAL_STORAGE_DIR", str(default_root))).expanduser().resolve()
+
     def put_existing_file(self, path: Path, *, relative_path: str) -> StoredObject:
-        resolved = path.expanduser().resolve()
+        source = path.expanduser().resolve()
+        digest = _sha256_file(source)
+        normalized_relative = "/".join(_safe_path_segment(part) for part in Path(relative_path).as_posix().split("/") if part)
+        key = "/".join(part for part in (digest[:2], digest[:12], normalized_relative) if part)
+        resolved = self.root_dir / key
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        if source != resolved:
+            shutil.copyfile(source, resolved)
         return StoredObject(
             storage_backend=self.backend,
-            storage_key=relative_path,
+            storage_key=key,
             storage_path=str(resolved),
             storage_size=resolved.stat().st_size,
+            storage_etag=digest,
         )
 
 
@@ -78,14 +91,15 @@ class SeaweedFSObjectStorage(ObjectStorage):
         self._local = LocalObjectStorage()
 
     def put_existing_file(self, path: Path, *, relative_path: str) -> StoredObject:
-        local = self._local.put_existing_file(path, relative_path=relative_path)
         source = path.expanduser().resolve()
         if not self.filer_url:
+            local = self._local.put_existing_file(path, relative_path=relative_path)
             reason = "seaweedfs-filer-url-unconfigured"
             logger.warning("SeaweedFS upload skipped for %s: filer URL is not configured", relative_path)
             return self._fallback_object(local, relative_path, reason)
 
         digest = self._sha256(source)
+        source_size = source.stat().st_size
         key = self._object_key(relative_path=relative_path, digest=digest)
         url = self._object_url(self.filer_url, key)
         storage_path = self._object_url(self.public_base_url, key)
@@ -98,7 +112,7 @@ class SeaweedFSObjectStorage(ObjectStorage):
                 # common deployments, but GET is more reliable across versions.
                 get_response = client.get(url)
                 get_response.raise_for_status()
-                if int(get_response.headers.get("content-length") or len(get_response.content)) != local.storage_size:
+                if int(get_response.headers.get("content-length") or len(get_response.content)) != source_size:
                     raise RuntimeError("SeaweedFS read-back size mismatch")
 
             return StoredObject(
@@ -106,11 +120,12 @@ class SeaweedFSObjectStorage(ObjectStorage):
                 storage_bucket=self.bucket,
                 storage_key=key,
                 storage_path=storage_path,
-                storage_size=local.storage_size,
+                storage_size=source_size,
                 storage_status="active",
                 storage_etag=digest,
             )
         except Exception as exc:
+            local = self._local.put_existing_file(path, relative_path=relative_path)
             reason = self._error_reason("seaweedfs-upload-failed", exc)
             logger.warning("SeaweedFS upload failed for %s: %s; using local fallback", relative_path, reason)
             return self._fallback_object(local, relative_path, reason)
@@ -191,6 +206,14 @@ def _safe_path_segment(value: str) -> str:
     value = re.sub(r"\s+", "-", value)
     value = re.sub(r"[^0-9A-Za-z._=-]+", "-", value)
     return value.strip(".-_") or "_"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def create_storage(

@@ -10,6 +10,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import threading
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from api.storage import create_storage
 TEXT_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".html", ".htm", ".rst"}
 DEFAULT_RETENTION_VERSIONS = 2
 logger = logging.getLogger(__name__)
+_SCHEMA_INIT_LOCK = threading.Lock()
+_INITIALIZED_SCHEMA_URLS: set[str] = set()
+_SCHEMA_ADVISORY_LOCK_NAME = "codingrag.document-registry.schema.v1"
 
 
 @dataclass(frozen=True)
@@ -353,10 +357,18 @@ class DocumentRegistry:
         return psycopg.connect(self.database_url, row_factory=dict_row)
 
     def init_schema(self) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(SCHEMA_SQL)
-                self._apply_migrations(cur)
+        if self.database_url not in _INITIALIZED_SCHEMA_URLS:
+            with _SCHEMA_INIT_LOCK:
+                if self.database_url not in _INITIALIZED_SCHEMA_URLS:
+                    with self._connect() as conn:
+                        with conn.cursor() as cur:
+                            # DDL initialization may be reached by concurrent API requests
+                            # or separate worker processes during startup.
+                            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [_SCHEMA_ADVISORY_LOCK_NAME])
+                            cur.execute(SCHEMA_SQL)
+                            self._apply_migrations(cur)
+                    _INITIALIZED_SCHEMA_URLS.add(self.database_url)
+
         if not domain_cache._loaded:
             domain_cache.load()
         if not query_expansion_cache._loaded:
@@ -516,6 +528,54 @@ class DocumentRegistry:
             )
             doc["versions"] = list(cur.fetchall())
             return doc
+
+    def list_index_jobs(
+        self,
+        *,
+        domain: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Expose latest persisted indexing state until index-job history exists."""
+        self.init_schema()
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        clauses = ["d.deleted_at IS NULL"]
+        params: list[Any] = []
+        if domain:
+            clauses.append("d.domain = %s")
+            params.append(domain.strip().lower())
+        if status:
+            clauses.append("d.status = %s")
+            params.append(status.strip().lower())
+        where = " AND ".join(clauses)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS total FROM documents d WHERE {where}", params)
+            total = cur.fetchone()["total"]
+            cur.execute(
+                f"""
+                SELECT d.id AS id, d.id AS document_id, d.library_id, d.domain,
+                       d.title, d.relative_path, d.status, d.chunk_count,
+                       d.index_required, d.indexed_at, d.last_index_error_at,
+                       d.error_message, d.updated_at, l.code AS library_code,
+                       l.qdrant_collection, l.opensearch_index
+                FROM documents d
+                JOIN doc_libraries l ON l.id = d.library_id
+                WHERE {where}
+                ORDER BY COALESCE(d.indexed_at, d.last_index_error_at, d.updated_at) DESC, d.id
+                LIMIT %s OFFSET %s
+                """,
+                [*params, limit, offset],
+            )
+            return {
+                "source": "document-index-state",
+                "history_available": False,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": list(cur.fetchall()),
+            }
 
     def get_document_content(self, document_id: str, *, version: int | None = None) -> dict[str, Any] | None:
         self.init_schema()
@@ -1855,7 +1915,10 @@ END $$;
 DO $$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'document_versions_storage_backend_check'
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'document_versions_storage_backend_check'
+      AND pg_get_constraintdef(oid) NOT LIKE '%fastdfs%'
   ) THEN
     ALTER TABLE document_versions DROP CONSTRAINT document_versions_storage_backend_check;
   END IF;

@@ -129,6 +129,17 @@ CODING_RAG_PRELOAD_DOMAINS=ios,harmonyos python3 -m uvicorn api.app:app --host 0
 - `api/app.py` — FastAPI 应用，按 domain 懒加载 engine 实例
 - BM25 索引按 domain 缓存，首次请求某领域时加载，后续复用
 
+### Phase 5 management endpoints
+
+- `GET /api/docs/{document_id}/chunks?limit=50&offset=...` reads current chunk
+  payloads from Qdrant and returns `items`, `total`, and `next_offset`.
+- `DELETE /api/docs/{document_id}/index` removes the document's Qdrant and
+  configured keyword-index entries, then marks enabled documents for reindex.
+- `GET /api/index/jobs?domain=...&status=...` returns latest persisted
+  per-document indexing state from `documents`. The response includes
+  `"source": "document-index-state"` and `"history_available": false`
+  because no historical index-job table is persisted yet.
+
 ## 不影响现有代码
 
 - `scripts/test_rag.py` 不受影响
