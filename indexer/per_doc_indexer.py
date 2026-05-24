@@ -266,17 +266,30 @@ class PerDocumentIndexer:
             )
         return points
 
-    def _mark_indexed(self, doc_id: str, chunk_count: int) -> None:
+    def _mark_indexed(self, doc_id: str, chunk_count: int, embedding_model: str = "", embedding_model_name: str = "") -> None:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE documents
-                SET indexed_at = now(), chunk_count = %s, status = 'indexed',
-                    error_message = NULL, index_required = FALSE, updated_at = now()
-                WHERE id = %s AND deleted_at IS NULL
-                """,
-                [chunk_count, doc_id],
-            )
+            if embedding_model or embedding_model_name:
+                cur.execute(
+                    """
+                    UPDATE documents
+                    SET indexed_at = now(), chunk_count = %s, status = 'indexed',
+                        error_message = NULL, index_required = FALSE, updated_at = now(),
+                        embedding_model = COALESCE(%s, embedding_model),
+                        embedding_model_name = COALESCE(%s, embedding_model_name)
+                    WHERE id = %s AND deleted_at IS NULL
+                    """,
+                    [chunk_count, embedding_model or None, embedding_model_name or None, doc_id],
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE documents
+                    SET indexed_at = now(), chunk_count = %s, status = 'indexed',
+                        error_message = NULL, index_required = FALSE, updated_at = now()
+                    WHERE id = %s AND deleted_at IS NULL
+                    """,
+                    [chunk_count, doc_id],
+                )
             conn.commit()
 
     def _mark_failed(self, doc_id: str, error: Exception) -> None:
@@ -354,7 +367,12 @@ class PerDocumentIndexer:
                     es_indexer.close()
                 except Exception:
                     logger.exception("ES indexing failed for doc_id=%s (Qdrant succeeded)", doc_id)
-            self._mark_indexed(doc_id, len(points))
+            self._mark_indexed(
+                doc_id,
+                len(points),
+                embedding_model=cfg.get("embedding_model", ""),
+                embedding_model_name=cfg.get("embedding_model_name", ""),
+            )
             result: dict[str, Any] = {
                 "doc_id": doc_id,
                 "domain": document["domain"],

@@ -257,8 +257,9 @@ def split_blocks(blocks: List[Block], source_file: str = "",
     算法：
     1. 代码块向上合并（与前面的标题/说明文字绑定）
     2. 按标题层级递归切分
-    3. 注入上下文前缀
-    4. 相邻 chunk 重叠
+    3. 合并不足最小 token 数的相邻分组
+    4. 注入上下文前缀
+    5. 相邻 chunk 重叠
     """
     if not blocks:
         return []
@@ -269,7 +270,20 @@ def split_blocks(blocks: List[Block], source_file: str = "",
     # Step 2: 递归切分
     groups = _split_group_recursive(merged, max_tokens, min_tokens)
 
-    # Step 3: 构造 Chunk 列表
+    # Step 3: 合并相邻的微小分组，避免标题下极短内容单独入索引。
+    compact_groups: List[List[Block]] = []
+    for group in groups:
+        if compact_groups:
+            previous = compact_groups[-1]
+            previous_tokens = estimate_tokens(_blocks_text(previous))
+            combined_tokens = estimate_tokens(_blocks_text(previous + group))
+            if previous_tokens < min_tokens and combined_tokens <= max_tokens:
+                compact_groups[-1] = previous + group
+                continue
+        compact_groups.append(group)
+    groups = compact_groups
+
+    # Step 4: 构造 Chunk 列表
     context = ""
     if merged:
         # 取第一个 block 的 context 作为文档级 context
@@ -297,7 +311,7 @@ def split_blocks(blocks: List[Block], source_file: str = "",
         )
         chunks_data.append({"text": chunk.text, "metadata": chunk.metadata})
 
-    # Step 4: 添加重叠
+    # Step 5: 添加重叠
     chunks_data = _add_overlap(chunks_data, overlap_tokens)
 
     return [Chunk(text=d["text"], metadata=d["metadata"]) for d in chunks_data]

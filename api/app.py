@@ -51,6 +51,7 @@ from api.schemas import (  # noqa: E402
     LibraryImportRequest,
     IngestJobCreateRequest,
     IngestServerDirRequest,
+    ReindexJobCreateRequest,
     DomainItem,
     DomainRequest,
     RagQueryRequest,
@@ -229,41 +230,18 @@ def delete_domain(domain_key: str):
 
 @app.post("/api/domains/{domain_key}/reindex-all")
 def reindex_all_docs(domain_key: str):
-    """Mark all enabled documents in a domain for reindex and run full reindex."""
+    """Mark all enabled documents and enqueue a background reindex job."""
     normalized = domain_key.strip().lower()
     try:
-        _get_registry().init_schema()
-        domain_item = next((d for d in domain_cache.list_domains() if d["domain_key"] == normalized), None)
-        if domain_item is None:
-            raise HTTPException(status_code=404, detail=f"Unknown domain={domain_key!r}")
-        with _get_registry()._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE documents
-                SET index_required = TRUE, updated_at = now()
-                WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
-                """,
-                [normalized],
-            )
-            marked = cur.rowcount
-            conn.commit()
-        indexer = PerDocumentIndexer()
-        result = indexer.reindex_changed(normalized)
-        return {
-            "domain": normalized,
-            "marked_for_reindex": marked,
-            "total": result.get("total", 0),
-            "indexed": result.get("indexed", 0),
-            "failed": result.get("failed", 0),
-            "failures": result.get("failures", []),
-        }
+        return _get_registry().create_reindex_job(normalized, changed_only=True, mark_all=True)
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 404 if str(e).startswith("Unknown domain=") else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         logger.exception("reindex_all_docs failed for domain=%s", normalized)
-        raise HTTPException(status_code=500, detail=f"Failed to reindex all docs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue reindex job: {e}")
 
 
 @app.get("/api/libraries")
@@ -442,6 +420,65 @@ def cancel_ingest_job(job_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to cancel ingest job: {e}")
 
 
+@app.post("/api/reindex-jobs", status_code=202)
+def create_reindex_job(req: ReindexJobCreateRequest):
+    """Queue changed documents for background indexing."""
+    try:
+        return _get_registry().create_reindex_job(req.domain, changed_only=req.changed_only)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        status_code = 404 if str(e).startswith("Unknown domain=") else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
+    except Exception as e:
+        logger.exception("create_reindex_job failed for domain=%s", req.domain)
+        raise HTTPException(status_code=500, detail=f"Failed to create reindex job: {e}")
+
+
+@app.get("/api/reindex-jobs")
+def list_reindex_jobs(
+    domain: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+):
+    """List recent background reindex jobs, optionally filtered by domain or status."""
+    try:
+        return _get_registry().list_reindex_jobs(domain=domain, status=status)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_reindex_jobs failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list reindex jobs: {e}")
+
+
+@app.get("/api/reindex-jobs/{job_id}")
+def get_reindex_job(job_id: str):
+    try:
+        job = _get_registry().get_reindex_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("get_reindex_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get reindex job: {e}")
+    if not job:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+    return job
+
+
+@app.post("/api/reindex-jobs/{job_id}/retry")
+def retry_reindex_job(job_id: str):
+    try:
+        return _get_registry().retry_reindex_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("retry_reindex_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to retry reindex job: {e}")
+
+
 @app.get("/api/query-expansions", response_model=list[QueryExpansionItem])
 def list_query_expansions(domain: Optional[str] = Query(None)):
     """List persisted query expansions, optionally filtered by domain."""
@@ -544,17 +581,17 @@ def reindex_changed_docs(
     domain: str = Query(..., description="Domain whose changed documents should be reindexed"),
     changed_only: bool = Query(True, description="Only index enabled documents that require indexing"),
 ):
-    if not changed_only:
-        raise HTTPException(status_code=400, detail="Only changed_only=true indexing is supported")
+    """Compatibility endpoint that now queues a background reindex job."""
     try:
-        return PerDocumentIndexer().reindex_changed(domain)
+        return _get_registry().create_reindex_job(domain, changed_only=changed_only)
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 404 if str(e).startswith("Unknown domain=") else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         logger.exception("reindex_changed_docs failed for domain=%s", domain)
-        raise HTTPException(status_code=502, detail=f"Failed to reindex changed docs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue reindex job: {e}")
 
 
 @app.post("/api/docs/{document_id}/reindex")

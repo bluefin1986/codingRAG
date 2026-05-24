@@ -112,6 +112,13 @@ class IngestServerDirRequest(BaseModel):
     batch_size: Optional[int] = Field(None, ge=1, le=1000, description="Override this job's batch size.")
 
 
+class ReindexJobCreateRequest(BaseModel):
+    """POST /api/reindex-jobs request body."""
+
+    domain: str = Field(..., min_length=1, description="Formal domain whose changed documents should be indexed.")
+    changed_only: bool = Field(True, description="Only documents already marked index_required are supported.")
+
+
 class QueryExpansionRequest(BaseModel):
     """POST /api/query-expansions request body."""
 

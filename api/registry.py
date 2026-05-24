@@ -384,6 +384,7 @@ class DocumentRegistry:
         cur.execute(DOMAIN_SCHEMA_SQL)
         cur.execute(QUERY_EXPANSION_SCHEMA_SQL)
         cur.execute(INGEST_SCHEMA_SQL)
+        cur.execute(REINDEX_SCHEMA_SQL)
 
     def list_libraries(self) -> list[dict[str, Any]]:
         self.init_schema()
@@ -982,6 +983,296 @@ class DocumentRegistry:
             WHERE id = %s
             """,
             [Jsonb(to_jsonable(counts)), job_id],
+        )
+
+    def create_reindex_job(
+        self,
+        domain: str,
+        *,
+        changed_only: bool = True,
+        mark_all: bool = False,
+    ) -> dict[str, Any]:
+        """Snapshot eligible documents into a background reindex job."""
+        domain, _ = self._require_domain(domain)
+        if not changed_only:
+            raise ValueError("Only changed_only=true indexing is supported")
+        job_id = str(uuid.uuid4())
+        with self._connect() as conn, conn.cursor() as cur:
+            if mark_all:
+                # Get domain's current embedding model name for comparison
+                domain_item = next((d for d in self.list_domains() if d["domain_key"] == domain), None)
+                target_model = (domain_item or {}).get("embedding_model_name", "")
+                if target_model:
+                    # Only mark docs whose current embedding model differs from target
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET index_required = TRUE, updated_at = now()
+                        WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
+                          AND (embedding_model_name IS NULL OR embedding_model_name != %s OR indexed_at IS NULL)
+                        """,
+                        [domain, target_model],
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET index_required = TRUE, updated_at = now()
+                        WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
+                        """,
+                        [domain],
+                    )
+            cur.execute(
+                """
+                INSERT INTO reindex_jobs (id, domain, changed_only, status)
+                VALUES (%s, %s, %s, 'pending')
+                """,
+                [job_id, domain, changed_only],
+            )
+            cur.execute(
+                """
+                INSERT INTO reindex_items (id, job_id, document_id, status)
+                SELECT gen_random_uuid(), %s, d.id, 'pending'
+                FROM documents d
+                WHERE d.domain = %s
+                  AND d.index_required = TRUE
+                  AND d.enabled = TRUE
+                  AND d.deleted_at IS NULL
+                ORDER BY d.updated_at, d.id
+                """,
+                [job_id, domain],
+            )
+            self._refresh_reindex_summary(cur, job_id)
+            conn.commit()
+        return self.get_reindex_job(job_id) or {}
+
+    def list_reindex_jobs(
+        self,
+        *,
+        domain: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent reindex job summaries without expanding item details."""
+        self.init_schema()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if domain is not None:
+            conditions.append("domain = %s")
+            params.append(domain.strip().lower())
+        if status is not None:
+            conditions.append("status = %s")
+            params.append(status.strip().lower())
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, domain, changed_only, status, total, processed, indexed, failed,
+                       retry_count, error_message, created_at, updated_at, started_at, finished_at
+                FROM reindex_jobs
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                params,
+            )
+            return list(cur.fetchall())
+
+    def get_reindex_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM reindex_jobs WHERE id = %s", [job_id])
+            job = cur.fetchone()
+            if not job:
+                return None
+            cur.execute(
+                """
+                SELECT ri.id, ri.document_id, d.title, d.relative_path, ri.status,
+                       ri.error_message, ri.created_at, ri.updated_at
+                FROM reindex_items ri
+                LEFT JOIN documents d ON d.id = ri.document_id
+                WHERE ri.job_id = %s
+                ORDER BY ri.created_at, ri.id
+                LIMIT 500
+                """,
+                [job_id],
+            )
+            job["items"] = list(cur.fetchall())
+            return job
+
+    def retry_reindex_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] != "failed":
+                raise ValueError("only failed reindex jobs can be retried")
+            cur.execute(
+                """
+                UPDATE reindex_items
+                SET status = 'pending', error_message = NULL, updated_at = now()
+                WHERE job_id = %s AND status IN ('failed', 'processing')
+                """,
+                [job_id],
+            )
+            cur.execute(
+                """
+                UPDATE reindex_jobs
+                SET status = 'pending', retry_count = retry_count + 1,
+                    error_message = NULL, finished_at = NULL, updated_at = now()
+                WHERE id = %s
+                """,
+                [job_id],
+            )
+            self._refresh_reindex_summary(cur, job_id)
+            conn.commit()
+        return self.get_reindex_job(job_id) or {}
+
+    def run_pending_reindex_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM reindex_jobs
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                [max(1, limit)],
+            )
+            ids = [str(row["id"]) for row in cur.fetchall()]
+        return [self.run_reindex_job(job_id) for job_id in ids]
+
+    def run_reindex_job(self, job_id: str) -> dict[str, Any]:
+        """Index one queued job item-by-item so API requests never perform bulk work."""
+        from indexer.per_doc_indexer import PerDocumentIndexer
+
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE reindex_jobs
+                SET status = 'running', started_at = COALESCE(started_at, now()),
+                    error_message = NULL, updated_at = now()
+                WHERE id = %s AND status = 'pending'
+                RETURNING id
+                """,
+                [job_id],
+            )
+            claimed = cur.fetchone()
+            conn.commit()
+        if not claimed:
+            existing = self.get_reindex_job(job_id)
+            if not existing:
+                raise KeyError(job_id)
+            return existing
+
+        try:
+            indexer = PerDocumentIndexer(self.database_url)
+            while True:
+                with self._connect() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT status FROM reindex_jobs WHERE id = %s", [job_id])
+                    job = cur.fetchone()
+                    if not job or job["status"] != "running":
+                        return self.get_reindex_job(job_id) or {}
+                    cur.execute(
+                        """
+                        UPDATE reindex_items
+                        SET status = 'processing', updated_at = now()
+                        WHERE id = (
+                            SELECT id FROM reindex_items
+                            WHERE job_id = %s AND status = 'pending'
+                            ORDER BY created_at, id
+                            LIMIT 1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING document_id
+                        """,
+                        [job_id],
+                    )
+                    item = cur.fetchone()
+                    self._refresh_reindex_summary(cur, job_id)
+                    conn.commit()
+                if not item:
+                    break
+                document_id = str(item["document_id"])
+                try:
+                    indexer.index_document(document_id)
+                    with self._connect() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE reindex_items
+                            SET status = 'indexed', error_message = NULL, updated_at = now()
+                            WHERE job_id = %s AND document_id = %s AND status = 'processing'
+                            """,
+                            [job_id, document_id],
+                        )
+                        self._refresh_reindex_summary(cur, job_id)
+                        conn.commit()
+                except Exception as exc:
+                    logger.exception("Reindex job item failed for job_id=%s document_id=%s", job_id, document_id)
+                    with self._connect() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE reindex_items
+                            SET status = 'failed', error_message = %s, updated_at = now()
+                            WHERE job_id = %s AND document_id = %s AND status = 'processing'
+                            """,
+                            [str(exc)[:2000], job_id, document_id],
+                        )
+                        self._refresh_reindex_summary(cur, job_id)
+                        conn.commit()
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT failed FROM reindex_jobs WHERE id = %s", [job_id])
+                status = "failed" if cur.fetchone()["failed"] else "completed"
+                cur.execute(
+                    """
+                    UPDATE reindex_jobs
+                    SET status = %s, finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [status, job_id],
+                )
+                self._refresh_reindex_summary(cur, job_id)
+                conn.commit()
+            return self.get_reindex_job(job_id) or {}
+        except Exception as exc:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE reindex_jobs
+                    SET status = 'failed', error_message = %s,
+                        finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [str(exc)[:2000], job_id],
+                )
+                self._refresh_reindex_summary(cur, job_id)
+                conn.commit()
+            raise
+
+    def _refresh_reindex_summary(self, cur, job_id: str) -> None:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COUNT(*) FILTER (WHERE status IN ('indexed', 'failed'))::int AS processed,
+                   COUNT(*) FILTER (WHERE status = 'indexed')::int AS indexed,
+                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+            FROM reindex_items
+            WHERE job_id = %s
+            """,
+            [job_id],
+        )
+        counts = cur.fetchone()
+        cur.execute(
+            """
+            UPDATE reindex_jobs
+            SET total = %s, processed = %s, indexed = %s, failed = %s,
+                updated_at = now()
+            WHERE id = %s
+            """,
+            [counts["total"], counts["processed"], counts["indexed"], counts["failed"], job_id],
         )
 
     def scan_domain(self, domain: str, *, limit: int | None = None) -> ScanResult:
@@ -2568,6 +2859,8 @@ CREATE INDEX IF NOT EXISTS idx_document_retention_jobs_status ON document_retent
 """
 
 MIGRATION_SQL = """
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_model_name TEXT;
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS retrieval_mode TEXT NOT NULL DEFAULT 'hybrid_rerank';
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 ALTER TABLE doc_libraries ADD COLUMN IF NOT EXISTS embedding_model_name TEXT;
@@ -2687,4 +2980,41 @@ CREATE TABLE IF NOT EXISTS knowledge_ingest_items (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_job_id ON knowledge_ingest_items(job_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_status ON knowledge_ingest_items(status);
+"""
+
+REINDEX_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS reindex_jobs (
+    id UUID PRIMARY KEY,
+    domain TEXT NOT NULL,
+    changed_only BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total INTEGER NOT NULL DEFAULT 0,
+    processed INTEGER NOT NULL DEFAULT 0,
+    indexed INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    CHECK (changed_only = TRUE),
+    CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled'))
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_jobs_domain ON reindex_jobs(domain);
+CREATE INDEX IF NOT EXISTS idx_reindex_jobs_status ON reindex_jobs(status);
+
+CREATE TABLE IF NOT EXISTS reindex_items (
+    id UUID PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES reindex_jobs(id),
+    document_id UUID NOT NULL REFERENCES documents(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(job_id, document_id),
+    CHECK (status IN ('pending', 'processing', 'indexed', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_items_job_id ON reindex_items(job_id);
+CREATE INDEX IF NOT EXISTS idx_reindex_items_status ON reindex_items(status);
 """
