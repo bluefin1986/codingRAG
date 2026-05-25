@@ -133,6 +133,10 @@ class DomainCache:
                 rows = list(cur.fetchall())
         except (RegistryUnavailable, psycopg.Error) as exc:
             logger.warning("Unable to load domains from PostgreSQL: %s", exc)
+            # Keep the last successfully loaded snapshot during a transient
+            # database failure. Misses will attempt another reload later.
+            self._loaded = True
+            return
 
         self._rows = {row["domain_key"]: row for row in rows}
         self._cache = {row["domain_key"]: self._to_config(row) for row in rows if row["enabled"]}
@@ -738,6 +742,9 @@ class DocumentRegistry:
                 return existing
             conn.commit()
         try:
+            # Configuration is stable for one job, but must not be stale from
+            # an earlier API-process domain create/update.
+            domain_cache.refresh()
             if job["source_type"] == "server_dir":
                 self._discover_server_dir_items(job)
             self._run_ingest_items(job_id, batch_size=int(job["batch_size"]))
@@ -1247,6 +1254,9 @@ class DocumentRegistry:
             return existing
 
         try:
+            # One refresh per claimed job publishes domain updates without
+            # adding a PostgreSQL read for every indexed document or chunk.
+            domain_cache.refresh()
             indexer = PerDocumentIndexer(self.database_url)
             while True:
                 with self._connect() as conn, conn.cursor() as cur:

@@ -36,6 +36,8 @@ services:
       - opensearch
       - postgres
       - seaweedfs-filer
+    volumes:
+      - ${CODING_RAG_INGEST_STAGING_DIR:-./data/ingest-jobs}:/app/output/ingest-jobs
     restart: unless-stopped
 
   library-import-worker:
@@ -62,6 +64,8 @@ services:
     depends_on:
       - postgres
       - seaweedfs-filer
+    volumes:
+      - ${CODING_RAG_INGEST_STAGING_DIR:-./data/ingest-jobs}:/app/output/ingest-jobs:ro
     restart: unless-stopped
 
   reindex-worker:

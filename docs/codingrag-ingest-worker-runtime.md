@@ -5,6 +5,12 @@ server directory is queued. A continuously running `scripts/library_import_worke
 process must consume those jobs. This worker registers document source content only;
 it does not create chunks, embeddings, or index jobs.
 
+Long-running ingest and reindex workers refresh PostgreSQL-backed domain
+configuration once when they claim a job. Domain changes therefore apply to
+the next claimed job, while a job already in progress uses one cached
+configuration rather than querying PostgreSQL per document or for each
+library-fallback lookup.
+
 ## Docker Compose
 
 The Compose deployment already includes `library-import-worker`, using the same image
@@ -15,6 +21,23 @@ docker compose up -d
 docker compose ps app library-import-worker
 docker compose logs -f library-import-worker
 ```
+
+Browser uploads are staged at the fixed container path
+`/app/output/ingest-jobs`. The API container writes those files and the ingest
+worker reads them, so Compose mounts the same persistent host directory into
+both containers. Set the host-side path in `.env` before deployment:
+
+```bash
+CODING_RAG_INGEST_STAGING_DIR=/Volumes/BDisk/bizData/codingrag/ingest-jobs
+mkdir -p /Volumes/BDisk/bizData/codingrag/ingest-jobs
+docker compose up -d --force-recreate app library-import-worker
+```
+
+`CODING_RAG_INGEST_STAGING_DIR` is a Compose interpolation variable, not an
+application configuration value: Python continues reading and writing the
+fixed mounted path. Existing failed upload jobs cannot be retried after their
+previous unmounted container files have been lost; submit those uploads again
+after recreating the services with this mount.
 
 Do not also start a host-side worker against the same database unless intentionally
 testing multiple consumers.
