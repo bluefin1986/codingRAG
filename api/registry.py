@@ -657,7 +657,7 @@ class DocumentRegistry:
     def retry_ingest_job(self, job_id: str) -> dict[str, Any]:
         self.init_schema()
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            cur.execute("SELECT * FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job_id])
             job = cur.fetchone()
             if not job:
                 raise KeyError(job_id)
@@ -683,7 +683,7 @@ class DocumentRegistry:
     def cancel_ingest_job(self, job_id: str) -> dict[str, Any]:
         self.init_schema()
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job_id])
             job = cur.fetchone()
             if not job:
                 raise KeyError(job_id)
@@ -871,6 +871,13 @@ class DocumentRegistry:
             conn.commit()
         for start in range(0, len(file_list), batch_size):
             with self._connect() as conn, conn.cursor() as cur:
+                # Lock parent before its items so cancel/retry and worker
+                # updates always acquire rows in the same order.
+                cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job["id"]])
+                state = cur.fetchone()
+                if not state or state["status"] == "cancelled":
+                    conn.commit()
+                    return
                 for path in file_list[start : start + batch_size]:
                     relative_path = path.relative_to(root).as_posix()
                     cur.execute(
@@ -937,6 +944,13 @@ class DocumentRegistry:
                     relative_path = validate_ingest_relative_path(item["relative_path"])
                     metadata = inspect_ingest_document(path, relative_path, job["domain"], cfg)
                     with self._connect() as conn, conn.cursor() as cur:
+                        # Use parent -> item lock order consistently with
+                        # cancel/retry to prevent summary-update deadlocks.
+                        cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job_id])
+                        state = cur.fetchone()
+                        if not state or state["status"] == "cancelled":
+                            conn.commit()
+                            return
                         cur.execute(
                             "UPDATE knowledge_ingest_items SET status = 'processing', updated_at = now() WHERE id = %s AND status = 'pending' RETURNING id",
                             [item["id"]],
@@ -960,6 +974,11 @@ class DocumentRegistry:
                         conn.commit()
                 except Exception as exc:
                     with self._connect() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job_id])
+                        state = cur.fetchone()
+                        if not state or state["status"] == "cancelled":
+                            conn.commit()
+                            return
                         cur.execute(
                             "UPDATE knowledge_ingest_items SET status = 'failed', error_message = %s, updated_at = now() WHERE id = %s",
                             [str(exc)[:2000], item["id"]],
