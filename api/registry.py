@@ -497,6 +497,8 @@ class DocumentRegistry:
         seen: set[str] = set()
         for relative_path, content in files:
             rel = validate_ingest_relative_path(relative_path)
+            if has_hidden_ingest_path_segment(rel):
+                continue
             if rel in seen:
                 raise ValueError(f"duplicate relative_path in upload: {rel}")
             if Path(rel).suffix.lower() not in TEXT_EXTENSIONS:
@@ -2743,6 +2745,11 @@ def validate_ingest_relative_path(value: str) -> str:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in normalized.split("/")):
         raise ValueError(f"unsafe relative_path: {value}")
     return path.as_posix()
+
+
+def has_hidden_ingest_path_segment(relative_path: str) -> bool:
+    """Return whether an already validated upload path contains hidden entries."""
+    return any(part.startswith(".") for part in relative_path.split("/"))
 
 
 def inspect_ingest_document(path: Path, relative_path: str, domain: str, cfg: dict[str, Any]) -> dict[str, Any]:
