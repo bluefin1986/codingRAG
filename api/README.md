@@ -67,6 +67,9 @@ CODING_RAG_DOMAIN=harmonyos python3 -m uvicorn api.app:app --host 0.0.0.0 --port
 
 - `GET /api/knowledge-bases`：返回 domain、主 library、文档计数和最近 ingest job。
 - `GET /api/knowledge-bases/{domain}/documents`：返回指定 domain 的登记文档。
+- `DELETE /api/knowledge-bases/{domain}/documents`：移除指定 formal domain 的当前派生
+  索引并软删除全部登记文档；保留原文版本存储，随后可用相同路径重新导入。存在
+  active ingest 或 reindex 作业时返回 `409`。
 - `POST /api/knowledge-bases/{domain}/ingest-jobs`：创建任务，请求体为
   `{"source_type":"upload","batch_size":100}` 或 `{"source_type":"server_dir"}`。
 - `POST /api/ingest-jobs/{id}/files`：以 multipart 提交重复 `files` 字段，并可提交

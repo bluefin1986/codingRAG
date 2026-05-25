@@ -459,6 +459,62 @@ class DocumentRegistry:
         self._require_domain(domain)
         return self.list_documents(domain=domain, status=status, q=q, limit=limit, offset=offset)
 
+    def prepare_knowledge_base_documents_clear(self, domain: str) -> list[dict[str, Any]]:
+        """Snapshot current formal-domain documents after rejecting active jobs."""
+        domain, _ = self._require_domain(domain)
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_domain_document_mutations(cur, domain)
+            self._raise_if_domain_jobs_active(cur, domain)
+            cur.execute(
+                """
+                SELECT d.id
+                FROM documents d
+                JOIN doc_libraries l ON l.id = d.library_id
+                WHERE l.code = %s AND l.domain = %s
+                  AND d.deleted_at IS NULL
+                ORDER BY d.created_at, d.id
+                """,
+                [domain, domain],
+            )
+            return list(cur.fetchall())
+
+    def soft_delete_knowledge_base_documents(self, domain: str, document_ids: list[str]) -> dict[str, Any]:
+        """Hide formal-domain documents while retaining stored source versions."""
+        domain, _ = self._require_domain(domain)
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_domain_document_mutations(cur, domain)
+            self._raise_if_domain_jobs_active(cur, domain)
+            if document_ids:
+                cur.execute(
+                    """
+                    UPDATE documents
+                    SET enabled = FALSE, status = 'deleted', deleted_at = now(),
+                        indexed_at = NULL, chunk_count = 0, index_required = FALSE,
+                        vector_indexed_at = NULL, vector_chunk_count = 0, vector_index_required = FALSE,
+                        bm25_indexed_at = NULL, bm25_chunk_count = 0, bm25_index_required = FALSE,
+                        error_message = NULL, vector_error_message = NULL, bm25_error_message = NULL,
+                        updated_at = now()
+                    WHERE id = ANY(%s::uuid[])
+                      AND library_id IN (
+                        SELECT id FROM doc_libraries WHERE code = %s AND domain = %s
+                      )
+                      AND deleted_at IS NULL
+                    RETURNING id
+                    """,
+                    [document_ids, domain, domain],
+                )
+                deleted_ids = [str(row["id"]) for row in cur.fetchall()]
+            else:
+                deleted_ids = []
+            conn.commit()
+        return {
+            "deleted": True,
+            "domain": domain,
+            "document_ids": deleted_ids,
+            "deleted_document_count": len(deleted_ids),
+            "retained_versions": True,
+        }
+
     def create_ingest_job(self, domain: str, *, source_type: str = "files", batch_size: int | None = None) -> dict[str, Any]:
         """Create one registration-only async job targeting the primary domain library."""
         domain, cfg = self._require_domain(domain)
@@ -474,6 +530,7 @@ class DocumentRegistry:
         status = "accepting"
         summary = self._empty_ingest_summary(source_type=normalized_source, batch_size=batch_size)
         with self._connect() as conn, conn.cursor() as cur:
+            self._lock_domain_document_mutations(cur, domain)
             library_id = self._upsert_domain_library(cur, domain, cfg)
             cur.execute(
                 """
@@ -795,6 +852,36 @@ class DocumentRegistry:
             raise ValueError(f"Unknown domain={normalized!r}") from None
 
     @staticmethod
+    def _lock_domain_document_mutations(cur, domain: str) -> None:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"knowledge-base-documents:{domain}"])
+
+    @staticmethod
+    def _raise_if_domain_jobs_active(cur, domain: str) -> None:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                     SELECT 1 FROM knowledge_ingest_jobs
+                     WHERE domain = %s AND status IN ('accepting', 'pending', 'running')
+                   ) AS active_ingest,
+                   EXISTS (
+                     SELECT 1 FROM reindex_jobs
+                     WHERE domain = %s AND status IN ('pending', 'running')
+                   ) AS active_reindex
+            """,
+            [domain, domain],
+        )
+        state = cur.fetchone() or {}
+        active: list[str] = []
+        if state.get("active_ingest"):
+            active.append("ingest")
+        if state.get("active_reindex"):
+            active.append("reindex")
+        if active:
+            raise IngestStateConflict(
+                f"cannot clear knowledge base documents while active {'/'.join(active)} jobs exist for domain={domain!r}"
+            )
+
+    @staticmethod
     def _empty_ingest_summary(*, source_type: str, batch_size: int) -> dict[str, Any]:
         return {
             "operation": "register",
@@ -1055,6 +1142,7 @@ class DocumentRegistry:
             raise ValueError("index_target must be one of: both, vector, bm25")
         job_id = str(uuid.uuid4())
         with self._connect() as conn, conn.cursor() as cur:
+            self._lock_domain_document_mutations(cur, domain)
             if mark_all:
                 # Get domain's current embedding model name for comparison
                 domain_item = next((d for d in self.list_domains() if d["domain_key"] == domain), None)
@@ -2600,6 +2688,15 @@ class DocumentRegistry:
                 UPDATE documents SET
                   title = %s, source_file = %s, local_path = %s, relative_path = %s,
                   mime_type = %s, content_length = %s, last_scanned_at = now(), scan_run_id = %s,
+                  enabled = CASE WHEN deleted_at IS NOT NULL THEN TRUE ELSE enabled END,
+                  status = CASE WHEN deleted_at IS NOT NULL THEN 'changed' ELSE status END,
+                  deleted_at = NULL,
+                  index_required = CASE WHEN deleted_at IS NOT NULL THEN TRUE ELSE index_required END,
+                  vector_index_required = CASE WHEN deleted_at IS NOT NULL THEN TRUE ELSE vector_index_required END,
+                  bm25_index_required = CASE WHEN deleted_at IS NOT NULL THEN TRUE ELSE bm25_index_required END,
+                  error_message = CASE WHEN deleted_at IS NOT NULL THEN NULL ELSE error_message END,
+                  vector_error_message = CASE WHEN deleted_at IS NOT NULL THEN NULL ELSE vector_error_message END,
+                  bm25_error_message = CASE WHEN deleted_at IS NOT NULL THEN NULL ELSE bm25_error_message END,
                   updated_at = now()
                 WHERE id = %s
                 """,
@@ -2624,8 +2721,11 @@ class DocumentRegistry:
               title = %s, source_file = %s, local_path = %s, relative_path = %s,
               mime_type = %s, language = %s, content_hash = %s, content_length = %s,
               version = %s, status = 'changed', last_scanned_at = now(), scan_run_id = %s,
+              enabled = CASE WHEN deleted_at IS NOT NULL THEN TRUE ELSE enabled END,
+              deleted_at = NULL,
               index_required = TRUE, vector_index_required = TRUE, bm25_index_required = TRUE,
-              error_message = NULL, updated_at = now()
+              error_message = NULL, vector_error_message = NULL, bm25_error_message = NULL,
+              updated_at = now()
             WHERE id = %s
             """,
             [

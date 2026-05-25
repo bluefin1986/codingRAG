@@ -300,6 +300,32 @@ def list_knowledge_base_documents(
         raise HTTPException(status_code=500, detail=f"Failed to list knowledge base documents: {e}")
 
 
+@app.delete("/api/knowledge-bases/{domain}/documents")
+def clear_knowledge_base_documents(domain: str):
+    """Soft-delete a formal domain's current documents after removing derived indexes."""
+    try:
+        registry = _get_registry()
+        documents = registry.prepare_knowledge_base_documents_clear(domain)
+        if documents:
+            indexer = PerDocumentIndexer()
+            for document in documents:
+                indexer.delete_document_index(str(document["id"]))
+        return registry.soft_delete_knowledge_base_documents(
+            domain,
+            [str(document["id"]) for document in documents],
+        )
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except IngestStateConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        status_code = 404 if str(e).startswith("Unknown domain=") else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
+    except Exception as e:
+        logger.exception("clear_knowledge_base_documents failed for domain=%s", domain)
+        raise HTTPException(status_code=502, detail=f"Failed to clear knowledge base documents: {e}")
+
+
 @app.post("/api/knowledge-bases/{domain}/ingest-jobs")
 def create_ingest_job(domain: str, req: Optional[IngestJobCreateRequest] = None):
     """Create an asynchronous registration-only ingest job for one formal domain."""
