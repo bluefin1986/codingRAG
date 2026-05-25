@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import psycopg
@@ -145,6 +147,58 @@ class _IngestRegistry(_RegistryWithoutSchemaInit):
         return {"id": job_id, "status": "completed"}
 
 
+class _MissingSourceCursor:
+    def __init__(self, statements: list[str], source_path: str) -> None:
+        self._statements = statements
+        self._source_path = source_path
+        self._next = None
+        self._returned_item = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, statement, params=None) -> None:
+        sql = " ".join(statement.split())
+        self._statements.append(sql)
+        if sql.startswith("SELECT status, domain, library_id FROM knowledge_ingest_jobs"):
+            self._next = {"status": "running", "domain": "docs", "library_id": "library-1"}
+        elif sql.startswith("SELECT id, relative_path, source_path FROM knowledge_ingest_items"):
+            if self._returned_item:
+                self._next = None
+            else:
+                self._returned_item = True
+                self._next = {"id": "item-1", "relative_path": "missing.md", "source_path": self._source_path}
+        elif sql.startswith("SELECT status FROM knowledge_ingest_jobs") and "FOR UPDATE" in sql:
+            self._next = {"status": "running"}
+        else:
+            self._next = None
+
+    def fetchone(self):
+        return self._next
+
+    def fetchall(self):
+        return [] if self._next is None else [self._next]
+
+
+class _MissingSourceRegistry(_RegistryWithoutSchemaInit):
+    def __init__(self, source_path: str) -> None:
+        super().__init__("postgresql://unused")
+        self.statements: list[str] = []
+        self._cursor = _MissingSourceCursor(self.statements, source_path)
+
+    def _connect(self):
+        return _Connection(self._cursor)
+
+    def _require_domain(self, domain: str) -> tuple[str, dict]:
+        return domain, _domain_config("docs")
+
+    def _refresh_ingest_summary(self, cur, job_id: str) -> None:
+        self.statements.append("REFRESH SUMMARY")
+
+
 class DomainCacheRefreshTest(unittest.TestCase):
     def test_failed_job_refresh_preserves_existing_cached_domains(self) -> None:
         cache = DomainCache("postgresql://unused")
@@ -210,6 +264,25 @@ class DomainCacheRefreshTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(registry.observed_collection, "updated-collection")
         load.assert_called_once_with()
+
+    def test_missing_source_failure_locks_parent_before_updating_item(self) -> None:
+        with TemporaryDirectory() as directory:
+            missing_path = str(Path(directory) / "missing.md")
+            registry = _MissingSourceRegistry(missing_path)
+            with patch.object(registry_module, "create_storage", return_value=object()):
+                registry._run_ingest_items("ingest-1", batch_size=1)
+
+        parent_lock = next(
+            index
+            for index, sql in enumerate(registry.statements)
+            if sql.startswith("SELECT status FROM knowledge_ingest_jobs") and "FOR UPDATE" in sql
+        )
+        failed_item_update = next(
+            index
+            for index, sql in enumerate(registry.statements)
+            if sql.startswith("UPDATE knowledge_ingest_items SET status = 'failed'")
+        )
+        self.assertLess(parent_lock, failed_item_update)
 
     def test_reindex_job_refreshes_cached_update_before_indexing(self) -> None:
         cache = DomainCache("postgresql://unused")

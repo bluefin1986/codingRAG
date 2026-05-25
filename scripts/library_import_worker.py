@@ -22,6 +22,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from api.registry import DocumentRegistry  # noqa: E402
 from config import CODING_RAG_IMPORT_BATCH_SIZE  # noqa: E402
 
+logger = logging.getLogger("codingrag.library_import_worker")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="codingRAG async library import / ingest worker")
@@ -37,17 +39,28 @@ def main() -> int:
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     registry = DocumentRegistry()
+    logger.info(
+        "Worker started ingest_only=%s once=%s limit=%s batch_size=%s sleep_seconds=%s",
+        args.ingest_only,
+        args.once,
+        args.limit,
+        args.batch_size,
+        args.sleep,
+    )
 
     if args.ingest_job_id:
+        logger.info("Running requested ingest job job_id=%s", args.ingest_job_id)
         result = registry.run_ingest_job(args.ingest_job_id)
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0
 
     if args.job_id:
+        logger.info("Running requested archive import job job_id=%s", args.job_id)
         result = registry.run_import_job(args.job_id, batch_size=args.batch_size)
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0
 
+    last_idle_log_at = 0.0
     while True:
         results = []
         if not args.ingest_only:
@@ -55,6 +68,11 @@ def main() -> int:
         results.extend(registry.run_pending_ingest_jobs(limit=args.limit))
         if results:
             print(json.dumps(results, ensure_ascii=False, default=str))
+        else:
+            now = time.monotonic()
+            if now - last_idle_log_at >= 60.0:
+                logger.info("Worker idle: no pending import or ingest jobs")
+                last_idle_log_at = now
         if args.once:
             return 0
         time.sleep(max(1.0, args.sleep))

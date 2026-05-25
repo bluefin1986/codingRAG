@@ -741,6 +741,13 @@ class DocumentRegistry:
                     raise KeyError(job_id)
                 return existing
             conn.commit()
+        logger.info(
+            "Ingest job claimed job_id=%s domain=%s source_type=%s batch_size=%s",
+            job_id,
+            job["domain"],
+            job["source_type"],
+            job["batch_size"],
+        )
         try:
             # Configuration is stable for one job, but must not be stale from
             # an earlier API-process domain create/update.
@@ -762,8 +769,10 @@ class DocumentRegistry:
                 )
                 self._refresh_ingest_summary(cur, job_id)
                 conn.commit()
+            logger.info("Ingest job finished job_id=%s status=%s", job_id, status)
             return self.get_ingest_job(job_id) or {}
         except Exception as exc:
+            logger.exception("Ingest job failed job_id=%s: %s", job_id, exc)
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute(
                     "UPDATE knowledge_ingest_jobs SET status = 'failed', error_message = %s, finished_at = now(), updated_at = now() WHERE id = %s AND status != 'cancelled'",
@@ -935,6 +944,7 @@ class DocumentRegistry:
                 items = list(cur.fetchall())
                 if not items:
                     return
+            logger.info("Ingest batch started job_id=%s item_count=%s", job_id, len(items))
             _, cfg = self._require_domain(job["domain"])
             for item in items:
                 try:
@@ -985,6 +995,20 @@ class DocumentRegistry:
                         )
                         self._refresh_ingest_summary(cur, job_id)
                         conn.commit()
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT summary FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+                state = cur.fetchone() or {}
+            summary = state.get("summary") or {}
+            logger.info(
+                "Ingest batch finished job_id=%s total=%s pending=%s created=%s changed=%s unchanged=%s failed=%s",
+                job_id,
+                summary.get("total_items"),
+                summary.get("pending"),
+                summary.get("created"),
+                summary.get("changed"),
+                summary.get("unchanged"),
+                summary.get("failed"),
+            )
 
     def _refresh_ingest_summary(self, cur, job_id: str) -> None:
         cur.execute(
