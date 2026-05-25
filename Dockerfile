@@ -11,7 +11,7 @@ RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
-
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 COPY . .
 
 ENV CODING_RAG_PRELOAD_DOMAINS=""

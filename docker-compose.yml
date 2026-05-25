@@ -47,7 +47,7 @@ services:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
         NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
-    image: ${CODINGRAG_IMAGE:-codingrag:latest}
+    image: ${CODINGRAG_IMPORT_WORKER_IMAGE:-codingrag-library-import-worker:latest}
     container_name: ${CODINGRAG_IMPORT_WORKER_CONTAINER_NAME:-codingrag-library-import-worker}
     command: python3 scripts/library_import_worker.py
     environment:
@@ -73,7 +73,7 @@ services:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
         NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
-    image: ${CODINGRAG_IMAGE:-codingrag:latest}
+    image: ${CODINGRAG_REINDEX_WORKER_IMAGE:-codingrag-reindex-worker:latest}
     container_name: ${CODINGRAG_REINDEX_WORKER_CONTAINER_NAME:-codingrag-reindex-worker}
     command: python3 scripts/reindex_worker.py
     environment:
@@ -96,7 +96,7 @@ services:
 
   postgres:
     platform: linux/amd64
-    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    image: ${POSTGRES_IMAGE:-postgres:16.9-alpine}
     container_name: ${POSTGRES_CONTAINER_NAME:-codingrag-postgres}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
