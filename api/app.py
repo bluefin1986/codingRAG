@@ -300,20 +300,11 @@ def list_knowledge_base_documents(
         raise HTTPException(status_code=500, detail=f"Failed to list knowledge base documents: {e}")
 
 
-@app.delete("/api/knowledge-bases/{domain}/documents")
+@app.delete("/api/knowledge-bases/{domain}/documents", status_code=202)
 def clear_knowledge_base_documents(domain: str):
-    """Soft-delete a formal domain's current documents after removing derived indexes."""
+    """Queue an exclusive background clear; the request never performs index I/O."""
     try:
-        registry = _get_registry()
-        documents = registry.prepare_knowledge_base_documents_clear(domain)
-        if documents:
-            indexer = PerDocumentIndexer()
-            for document in documents:
-                indexer.delete_document_index(str(document["id"]))
-        return registry.soft_delete_knowledge_base_documents(
-            domain,
-            [str(document["id"]) for document in documents],
-        )
+        return _get_registry().create_knowledge_base_clear_job(domain)
     except RegistryUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except IngestStateConflict as e:
@@ -323,7 +314,32 @@ def clear_knowledge_base_documents(domain: str):
         raise HTTPException(status_code=status_code, detail=str(e))
     except Exception as e:
         logger.exception("clear_knowledge_base_documents failed for domain=%s", domain)
-        raise HTTPException(status_code=502, detail=f"Failed to clear knowledge base documents: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue knowledge base clear: {e}")
+
+
+@app.get("/api/knowledge-clear-jobs")
+def list_knowledge_base_clear_jobs(domain: Optional[str] = None):
+    try:
+        return _get_registry().list_knowledge_base_clear_jobs(domain=domain)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("list_knowledge_base_clear_jobs failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list knowledge base clear jobs: {e}")
+
+
+@app.get("/api/knowledge-clear-jobs/{job_id}")
+def get_knowledge_base_clear_job(job_id: str):
+    try:
+        job = _get_registry().get_knowledge_base_clear_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("get_knowledge_base_clear_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get knowledge base clear job: {e}")
+    if not job:
+        raise HTTPException(status_code=404, detail="Knowledge base clear job not found")
+    return job
 
 
 @app.post("/api/knowledge-bases/{domain}/ingest-jobs")

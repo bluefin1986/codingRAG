@@ -223,41 +223,24 @@ class KnowledgeBaseClearRegistryTest(unittest.TestCase):
 class _ApiRegistry:
     def __init__(self, *, busy: bool = False) -> None:
         self.busy = busy
-        self.cleared_ids = None
 
-    def prepare_knowledge_base_documents_clear(self, domain: str) -> list[dict]:
+    def create_knowledge_base_clear_job(self, domain: str) -> dict:
         if self.busy:
             raise IngestStateConflict("cannot clear knowledge base documents while active ingest jobs exist")
-        return [{"id": DOCUMENT_ID}]
-
-    def soft_delete_knowledge_base_documents(self, domain: str, document_ids: list[str]) -> dict:
-        self.cleared_ids = document_ids
-        return {"deleted": True, "domain": domain, "document_ids": document_ids}
-
-
-class _ApiIndexer:
-    deleted_ids: list[str] = []
-
-    def delete_document_index(self, document_id: str) -> dict:
-        self.deleted_ids.append(document_id)
-        return {"deleted": True}
+        return {"id": "clear-1", "domain": domain, "status": "pending", "total": 1}
 
 
 class KnowledgeBaseClearApiTest(unittest.TestCase):
     def setUp(self) -> None:
-        _ApiIndexer.deleted_ids = []
         self.client = TestClient(app_module.app)
 
-    def test_delete_removes_indexes_before_soft_delete(self) -> None:
+    def test_delete_queues_background_clear(self) -> None:
         registry = _ApiRegistry()
-        with patch.object(app_module, "_registry", registry), patch.object(
-            app_module, "PerDocumentIndexer", _ApiIndexer
-        ):
+        with patch.object(app_module, "_registry", registry):
             response = self.client.delete("/api/knowledge-bases/docs/documents")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(_ApiIndexer.deleted_ids, [DOCUMENT_ID])
-        self.assertEqual(registry.cleared_ids, [DOCUMENT_ID])
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "pending")
 
     def test_delete_returns_conflict_for_active_job(self) -> None:
         with patch.object(app_module, "_registry", _ApiRegistry(busy=True)):

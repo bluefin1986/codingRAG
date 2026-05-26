@@ -457,6 +457,54 @@ class PerDocumentIndexer:
             "index_required": bool(document["enabled"]),
         }
 
+    def delete_domain_index(self, domain: str) -> dict[str, Any]:
+        """Remove one formal domain's derived entries with one request per backend."""
+        normalized = domain.strip().lower()
+        cfg = get_domain_config(normalized)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT qdrant_collection, keyword_backend, opensearch_index
+                FROM doc_libraries
+                WHERE code = %s AND domain = %s AND enabled
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                [normalized, normalized],
+            )
+            library = cur.fetchone() or {}
+        collection = str(library.get("qdrant_collection") or cfg["collection"])
+        with self._qdrant_client() as client:
+            response = client.post(
+                f"/collections/{collection}/points/delete",
+                params={"wait": "true"},
+                json={"filter": {"must": [{"key": "domain", "match": {"value": normalized}}]}},
+            )
+            if response.status_code != 404:
+                response.raise_for_status()
+
+        keyword_deleted = False
+        backend = str(library.get("keyword_backend") or "").strip().lower()
+        index_name = str(library.get("opensearch_index") or "").strip()
+        if CODING_RAG_ES_URL and backend in {"elasticsearch", "opensearch", "es"} and index_name:
+            es_indexer = ESIndexer(
+                base_url=CODING_RAG_ES_URL,
+                index_name=index_name,
+                api_key=CODING_RAG_ES_API_KEY or None,
+            )
+            try:
+                es_indexer.delete_domain(normalized)
+                keyword_deleted = True
+            finally:
+                es_indexer.close()
+        return {
+            "domain": normalized,
+            "collection": collection,
+            "status": "deleted-domain-index",
+            "vector_deleted": True,
+            "keyword_deleted": keyword_deleted,
+        }
+
     def list_document_chunks(
         self,
         doc_id: str,

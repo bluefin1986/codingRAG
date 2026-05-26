@@ -389,6 +389,7 @@ class DocumentRegistry:
         cur.execute(QUERY_EXPANSION_SCHEMA_SQL)
         cur.execute(INGEST_SCHEMA_SQL)
         cur.execute(REINDEX_SCHEMA_SQL)
+        cur.execute(CLEAR_SCHEMA_SQL)
 
     def list_libraries(self) -> list[dict[str, Any]]:
         self.init_schema()
@@ -445,6 +446,18 @@ class DocumentRegistry:
                     [row["domain_key"]],
                 )
                 row["latest_ingest_job"] = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT id, domain, status, total, deleted, error_message,
+                           created_at, updated_at, started_at, finished_at
+                    FROM knowledge_clear_jobs
+                    WHERE domain = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    [row["domain_key"]],
+                )
+                row["latest_clear_job"] = cur.fetchone()
             return rows
 
     def list_knowledge_base_documents(
@@ -515,6 +528,139 @@ class DocumentRegistry:
             "retained_versions": True,
         }
 
+    def create_knowledge_base_clear_job(self, domain: str) -> dict[str, Any]:
+        """Queue an exclusive asynchronous clear for one formal domain."""
+        domain, _ = self._require_domain(domain)
+        job_id = str(uuid.uuid4())
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_domain_document_mutations(cur, domain)
+            self._raise_if_domain_jobs_active(cur, domain)
+            cur.execute(
+                """
+                INSERT INTO knowledge_clear_jobs (id, domain, status, total)
+                SELECT %s, %s, 'pending', COUNT(d.id)::int
+                FROM documents d
+                JOIN doc_libraries l ON l.id = d.library_id
+                WHERE l.code = %s AND l.domain = %s AND d.deleted_at IS NULL
+                RETURNING *
+                """,
+                [job_id, domain, domain, domain],
+            )
+            job = cur.fetchone()
+            conn.commit()
+        return job
+
+    def list_knowledge_base_clear_jobs(self, *, domain: str | None = None) -> list[dict[str, Any]]:
+        self.init_schema()
+        params: list[Any] = []
+        where = ""
+        if domain:
+            where = "WHERE domain = %s"
+            params.append(domain.strip().lower())
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, domain, status, total, deleted, error_message,
+                       created_at, updated_at, started_at, finished_at
+                FROM knowledge_clear_jobs
+                {where}
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                params,
+            )
+            return list(cur.fetchall())
+
+    def get_knowledge_base_clear_job(self, job_id: str) -> dict[str, Any] | None:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM knowledge_clear_jobs WHERE id = %s", [job_id])
+            return cur.fetchone()
+
+    def run_pending_knowledge_base_clear_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM knowledge_clear_jobs
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                [max(1, limit)],
+            )
+            job_ids = [str(row["id"]) for row in cur.fetchall()]
+        return [self.run_knowledge_base_clear_job(job_id) for job_id in job_ids]
+
+    def run_knowledge_base_clear_job(self, job_id: str) -> dict[str, Any]:
+        """Delete derived indexes once per domain, then hide all current documents."""
+        from indexer.per_doc_indexer import PerDocumentIndexer
+
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE knowledge_clear_jobs
+                SET status = 'running', started_at = COALESCE(started_at, now()),
+                    error_message = NULL, updated_at = now()
+                WHERE id = %s AND status = 'pending'
+                RETURNING domain
+                """,
+                [job_id],
+            )
+            claimed = cur.fetchone()
+            conn.commit()
+        if not claimed:
+            existing = self.get_knowledge_base_clear_job(job_id)
+            if not existing:
+                raise KeyError(job_id)
+            return existing
+        domain = str(claimed["domain"])
+        try:
+            PerDocumentIndexer(self.database_url).delete_domain_index(domain)
+            with self._connect() as conn, conn.cursor() as cur:
+                self._lock_domain_document_mutations(cur, domain)
+                cur.execute(
+                    """
+                    UPDATE documents d
+                    SET enabled = FALSE, status = 'deleted', deleted_at = now(),
+                        indexed_at = NULL, chunk_count = 0, index_required = FALSE,
+                        vector_indexed_at = NULL, vector_chunk_count = 0, vector_index_required = FALSE,
+                        bm25_indexed_at = NULL, bm25_chunk_count = 0, bm25_index_required = FALSE,
+                        error_message = NULL, vector_error_message = NULL, bm25_error_message = NULL,
+                        updated_at = now()
+                    FROM doc_libraries l
+                    WHERE d.library_id = l.id AND l.code = %s AND l.domain = %s
+                      AND d.deleted_at IS NULL
+                    RETURNING d.id
+                    """,
+                    [domain, domain],
+                )
+                deleted = len(cur.fetchall())
+                cur.execute(
+                    """
+                    UPDATE knowledge_clear_jobs
+                    SET status = 'completed', deleted = %s, finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [deleted, job_id],
+                )
+                conn.commit()
+            return self.get_knowledge_base_clear_job(job_id) or {}
+        except Exception as exc:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE knowledge_clear_jobs
+                    SET status = 'failed', error_message = %s,
+                        finished_at = now(), updated_at = now()
+                    WHERE id = %s
+                    """,
+                    [str(exc)[:2000], job_id],
+                )
+                conn.commit()
+            raise
+
     def create_ingest_job(self, domain: str, *, source_type: str = "files", batch_size: int | None = None) -> dict[str, Any]:
         """Create one registration-only async job targeting the primary domain library."""
         domain, cfg = self._require_domain(domain)
@@ -531,6 +677,7 @@ class DocumentRegistry:
         summary = self._empty_ingest_summary(source_type=normalized_source, batch_size=batch_size)
         with self._connect() as conn, conn.cursor() as cur:
             self._lock_domain_document_mutations(cur, domain)
+            self._raise_if_clear_active(cur, domain)
             library_id = self._upsert_domain_library(cur, domain, cfg)
             cur.execute(
                 """
@@ -866,9 +1013,13 @@ class DocumentRegistry:
                    EXISTS (
                      SELECT 1 FROM reindex_jobs
                      WHERE domain = %s AND status IN ('pending', 'running')
-                   ) AS active_reindex
+                   ) AS active_reindex,
+                   EXISTS (
+                     SELECT 1 FROM knowledge_clear_jobs
+                     WHERE domain = %s AND status IN ('pending', 'running')
+                   ) AS active_clear
             """,
-            [domain, domain],
+            [domain, domain, domain],
         )
         state = cur.fetchone() or {}
         active: list[str] = []
@@ -876,10 +1027,26 @@ class DocumentRegistry:
             active.append("ingest")
         if state.get("active_reindex"):
             active.append("reindex")
+        if state.get("active_clear"):
+            active.append("clear")
         if active:
             raise IngestStateConflict(
                 f"cannot clear knowledge base documents while active {'/'.join(active)} jobs exist for domain={domain!r}"
             )
+
+    @staticmethod
+    def _raise_if_clear_active(cur, domain: str) -> None:
+        cur.execute(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM knowledge_clear_jobs
+              WHERE domain = %s AND status IN ('pending', 'running')
+            ) AS active_clear
+            """,
+            [domain],
+        )
+        if (cur.fetchone() or {}).get("active_clear"):
+            raise IngestStateConflict(f"cannot mutate knowledge base documents while active clear job exists for domain={domain!r}")
 
     @staticmethod
     def _empty_ingest_summary(*, source_type: str, batch_size: int) -> dict[str, Any]:
@@ -1143,6 +1310,7 @@ class DocumentRegistry:
         job_id = str(uuid.uuid4())
         with self._connect() as conn, conn.cursor() as cur:
             self._lock_domain_document_mutations(cur, domain)
+            self._raise_if_clear_active(cur, domain)
             if mark_all:
                 # Get domain's current embedding model name for comparison
                 domain_item = next((d for d in self.list_domains() if d["domain_key"] == domain), None)
@@ -3318,4 +3486,24 @@ SET vector_indexed = TRUE
 FROM reindex_jobs rj
 WHERE ri.job_id = rj.id AND rj.index_target = 'vector' AND ri.status = 'indexed'
   AND ri.vector_indexed = FALSE;
+"""
+
+CLEAR_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS knowledge_clear_jobs (
+    id UUID PRIMARY KEY,
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    CHECK (status IN ('pending', 'running', 'completed', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_clear_jobs_domain ON knowledge_clear_jobs(domain);
+CREATE INDEX IF NOT EXISTS idx_knowledge_clear_jobs_status ON knowledge_clear_jobs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_clear_jobs_active_domain
+ON knowledge_clear_jobs(domain) WHERE status IN ('pending', 'running');
 """

@@ -65,11 +65,13 @@ CODING_RAG_DOMAIN=harmonyos python3 -m uvicorn api.app:app --host 0.0.0.0 --port
 正式 `domain` 是知识库入口，主 library 使用相同 code。导入作业只登记原文、
 版本和 `index_required=true` 状态，不自动触发 embedding 或 reindex。
 
-- `GET /api/knowledge-bases`：返回 domain、主 library、文档计数和最近 ingest job。
+- `GET /api/knowledge-bases`：返回 domain、主 library、文档计数和最近 ingest/clear job。
 - `GET /api/knowledge-bases/{domain}/documents`：返回指定 domain 的登记文档。
-- `DELETE /api/knowledge-bases/{domain}/documents`：移除指定 formal domain 的当前派生
-  索引并软删除全部登记文档；保留原文版本存储，随后可用相同路径重新导入。存在
-  active ingest 或 reindex 作业时返回 `409`。
+- `DELETE /api/knowledge-bases/{domain}/documents`：创建后台清空任务并立即返回
+  `202`；worker 按 domain 批量移除 Qdrant/OpenSearch 派生索引，再软删除全部
+  当前文档并保留原文版本。存在 active ingest、reindex 或 clear 作业时返回 `409`。
+- `GET /api/knowledge-clear-jobs?domain={domain}` /
+  `GET /api/knowledge-clear-jobs/{job_id}`：查询后台清空任务状态和移除数量。
 - `POST /api/knowledge-bases/{domain}/ingest-jobs`：创建任务，请求体为
   `{"source_type":"upload","batch_size":100}` 或 `{"source_type":"server_dir"}`。
 - `POST /api/ingest-jobs/{id}/files`：以 multipart 提交重复 `files` 字段，并可提交

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run queued codingRAG background reindex jobs.
+"""Run queued codingRAG background clear and reindex jobs.
 
 Usage:
   python3 scripts/reindex_worker.py --once
@@ -42,7 +42,9 @@ def main() -> int:
         return 0
 
     while True:
-        results = registry.run_pending_reindex_jobs(limit=args.limit)
+        results = registry.run_pending_knowledge_base_clear_jobs(limit=args.limit)
+        if len(results) < args.limit:
+            results.extend(registry.run_pending_reindex_jobs(limit=args.limit - len(results)))
         if results:
             print(json.dumps(results, ensure_ascii=False, default=str))
         if args.once:
