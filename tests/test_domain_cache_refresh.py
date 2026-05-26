@@ -74,8 +74,8 @@ class _ReindexCursor:
             else:
                 self._claimed_item = True
                 self._next = {"document_id": "doc-1"}
-        elif sql.startswith("SELECT failed FROM reindex_jobs"):
-            self._next = {"failed": 0}
+        elif sql.startswith("SELECT status, failed FROM reindex_jobs"):
+            self._next = {"status": "running", "failed": 0}
         else:
             self._next = None
 

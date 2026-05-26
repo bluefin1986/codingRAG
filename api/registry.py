@@ -1093,7 +1093,7 @@ class DocumentRegistry:
                    ) AS active_ingest,
                    EXISTS (
                      SELECT 1 FROM reindex_jobs
-                     WHERE domain = %s AND status IN ('pending', 'running')
+                     WHERE domain = %s AND status IN ('pending', 'running', 'pausing', 'paused', 'cancelling')
                    ) AS active_reindex,
                    EXISTS (
                      SELECT 1 FROM knowledge_clear_jobs
@@ -1596,6 +1596,87 @@ class DocumentRegistry:
             conn.commit()
         return self.get_reindex_job(job_id) or {}
 
+    def pause_reindex_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] not in {"pending", "running"}:
+                raise ValueError("only pending or running reindex jobs can be paused")
+            status = "pausing" if job["status"] == "running" else "paused"
+            cur.execute(
+                """
+                UPDATE reindex_jobs
+                SET status = %s, updated_at = now()
+                WHERE id = %s
+                """,
+                [status, job_id],
+            )
+            conn.commit()
+        return self.get_reindex_job(job_id) or {}
+
+    def resume_reindex_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] != "paused":
+                raise ValueError("only paused reindex jobs can be resumed")
+            cur.execute(
+                """
+                UPDATE reindex_jobs
+                SET status = 'pending', finished_at = NULL, updated_at = now()
+                WHERE id = %s
+                """,
+                [job_id],
+            )
+            conn.commit()
+        return self.get_reindex_job(job_id) or {}
+
+    def cancel_reindex_job(self, job_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+            job = cur.fetchone()
+            if not job:
+                raise KeyError(job_id)
+            if job["status"] not in {"pending", "running", "pausing", "paused"}:
+                raise ValueError("only pending, running, pausing or paused reindex jobs can be cancelled")
+            status = "cancelling" if job["status"] in {"running", "pausing"} else "cancelled"
+            cur.execute(
+                """
+                UPDATE reindex_jobs
+                SET status = %s,
+                    finished_at = CASE WHEN %s = 'cancelled' THEN now() ELSE finished_at END,
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                [status, status, job_id],
+            )
+            conn.commit()
+        return self.get_reindex_job(job_id) or {}
+
+    @staticmethod
+    def _settle_reindex_control_state(cur, job_id: str, status: str) -> bool:
+        if status not in {"pausing", "cancelling"}:
+            return False
+        settled = "paused" if status == "pausing" else "cancelled"
+        cur.execute(
+            """
+            UPDATE reindex_jobs
+            SET status = %s,
+                finished_at = CASE WHEN %s = 'cancelled' THEN now() ELSE finished_at END,
+                updated_at = now()
+            WHERE id = %s AND status = %s
+            """,
+            [settled, settled, job_id, status],
+        )
+        return True
+
     def run_pending_reindex_jobs(self, *, limit: int = 1) -> list[dict[str, Any]]:
         self.init_schema()
         with self._connect() as conn, conn.cursor() as cur:
@@ -1642,9 +1723,12 @@ class DocumentRegistry:
             indexer = PerDocumentIndexer(self.database_url)
             while True:
                 with self._connect() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT status, index_target FROM reindex_jobs WHERE id = %s", [job_id])
+                    cur.execute("SELECT status, index_target FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
                     job = cur.fetchone()
                     if not job or job["status"] != "running":
+                        if job and self._settle_reindex_control_state(cur, job_id, str(job["status"])):
+                            self._refresh_reindex_summary(cur, job_id)
+                        conn.commit()
                         return self.get_reindex_job(job_id) or {}
                     cur.execute(
                         """
@@ -1702,30 +1786,35 @@ class DocumentRegistry:
                         self._refresh_reindex_summary(cur, job_id)
                         conn.commit()
             with self._connect() as conn, conn.cursor() as cur:
-                cur.execute("SELECT failed FROM reindex_jobs WHERE id = %s", [job_id])
-                status = "failed" if cur.fetchone()["failed"] else "completed"
-                cur.execute(
-                    """
-                    UPDATE reindex_jobs
-                    SET status = %s, finished_at = now(), updated_at = now()
-                    WHERE id = %s
-                    """,
-                    [status, job_id],
-                )
+                cur.execute("SELECT status, failed FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+                job = cur.fetchone()
+                if job and not self._settle_reindex_control_state(cur, job_id, str(job["status"])):
+                    status = "failed" if job["failed"] else "completed"
+                    cur.execute(
+                        """
+                        UPDATE reindex_jobs
+                        SET status = %s, finished_at = now(), updated_at = now()
+                        WHERE id = %s AND status = 'running'
+                        """,
+                        [status, job_id],
+                    )
                 self._refresh_reindex_summary(cur, job_id)
                 conn.commit()
             return self.get_reindex_job(job_id) or {}
         except Exception as exc:
             with self._connect() as conn, conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE reindex_jobs
-                    SET status = 'failed', error_message = %s,
-                        finished_at = now(), updated_at = now()
-                    WHERE id = %s
-                    """,
-                    [str(exc)[:2000], job_id],
-                )
+                cur.execute("SELECT status FROM reindex_jobs WHERE id = %s FOR UPDATE", [job_id])
+                job = cur.fetchone()
+                if job and not self._settle_reindex_control_state(cur, job_id, str(job["status"])):
+                    cur.execute(
+                        """
+                        UPDATE reindex_jobs
+                        SET status = 'failed', error_message = %s,
+                            finished_at = now(), updated_at = now()
+                        WHERE id = %s AND status = 'running'
+                        """,
+                        [str(exc)[:2000], job_id],
+                    )
                 self._refresh_reindex_summary(cur, job_id)
                 conn.commit()
             raise
@@ -3537,7 +3626,7 @@ CREATE TABLE IF NOT EXISTS reindex_jobs (
     finished_at TIMESTAMPTZ,
     CHECK (changed_only = TRUE),
     CHECK (index_target IN ('both', 'vector', 'bm25')),
-    CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled'))
+    CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled'))
 );
 CREATE INDEX IF NOT EXISTS idx_reindex_jobs_domain ON reindex_jobs(domain);
 CREATE INDEX IF NOT EXISTS idx_reindex_jobs_status ON reindex_jobs(status);
@@ -3560,6 +3649,32 @@ CREATE INDEX IF NOT EXISTS idx_reindex_items_status ON reindex_items(status);
 ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS index_target TEXT NOT NULL DEFAULT 'vector';
 ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS vector_indexed INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE reindex_jobs ADD COLUMN IF NOT EXISTS bm25_indexed INTEGER NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'reindex_jobs_status_check'
+      AND conrelid = 'reindex_jobs'::regclass
+      AND (
+        pg_get_constraintdef(oid) NOT LIKE '%paused%'
+        OR pg_get_constraintdef(oid) NOT LIKE '%pausing%'
+        OR pg_get_constraintdef(oid) NOT LIKE '%cancelling%'
+      )
+  ) THEN
+    ALTER TABLE reindex_jobs DROP CONSTRAINT reindex_jobs_status_check;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'reindex_jobs_status_check'
+      AND conrelid = 'reindex_jobs'::regclass
+  ) THEN
+    ALTER TABLE reindex_jobs
+      ADD CONSTRAINT reindex_jobs_status_check
+      CHECK (status IN ('pending', 'running', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled'));
+  END IF;
+END $$;
 ALTER TABLE reindex_items ADD COLUMN IF NOT EXISTS vector_indexed BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE reindex_items ADD COLUMN IF NOT EXISTS bm25_indexed BOOLEAN NOT NULL DEFAULT FALSE;
 UPDATE reindex_items ri

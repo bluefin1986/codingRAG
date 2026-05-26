@@ -533,6 +533,51 @@ def retry_reindex_job(job_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to retry reindex job: {e}")
 
 
+@app.post("/api/reindex-jobs/{job_id}/pause")
+def pause_reindex_job(job_id: str):
+    try:
+        return _get_registry().pause_reindex_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("pause_reindex_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to pause reindex job: {e}")
+
+
+@app.post("/api/reindex-jobs/{job_id}/resume")
+def resume_reindex_job(job_id: str):
+    try:
+        return _get_registry().resume_reindex_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("resume_reindex_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to resume reindex job: {e}")
+
+
+@app.post("/api/reindex-jobs/{job_id}/cancel")
+def cancel_reindex_job(job_id: str):
+    try:
+        return _get_registry().cancel_reindex_job(job_id)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.exception("cancel_reindex_job failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to cancel reindex job: {e}")
+
+
 @app.get("/api/query-expansions", response_model=list[QueryExpansionItem])
 def list_query_expansions(domain: Optional[str] = Query(None)):
     """List persisted query expansions, optionally filtered by domain."""
