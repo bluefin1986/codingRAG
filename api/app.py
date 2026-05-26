@@ -440,6 +440,24 @@ def get_ingest_job(job_id: str):
     return job
 
 
+@app.get("/api/ingest-jobs/{job_id}/failures")
+def list_ingest_job_failures(
+    job_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List persisted per-file ingest failures without expanding the job item snapshot."""
+    try:
+        return _get_registry().list_ingest_job_failures(job_id, limit=limit, offset=offset)
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    except Exception as e:
+        logger.exception("list_ingest_job_failures failed for job_id=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"Failed to list ingest job failures: {e}")
+
+
 @app.post("/api/ingest-jobs/{job_id}/retry")
 def retry_ingest_job(job_id: str):
     try:

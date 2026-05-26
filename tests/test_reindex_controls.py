@@ -115,7 +115,110 @@ class _ControlRegistry(DocumentRegistry):
         }
 
 
+class _CreateJobCursor:
+    def __init__(self) -> None:
+        self.documents = [
+            {
+                "id": "already-indexed",
+                "enabled": True,
+                "deleted": False,
+                "embedding_model_name": "bge-m3",
+                "vector_indexed": True,
+                "vector_required": False,
+            },
+            {
+                "id": "changed",
+                "enabled": True,
+                "deleted": False,
+                "embedding_model_name": "bge-m3",
+                "vector_indexed": True,
+                "vector_required": True,
+            },
+            {
+                "id": "disabled",
+                "enabled": False,
+                "deleted": False,
+                "embedding_model_name": "bge-m3",
+                "vector_indexed": True,
+                "vector_required": False,
+            },
+            {
+                "id": "deleted",
+                "enabled": True,
+                "deleted": True,
+                "embedding_model_name": "bge-m3",
+                "vector_indexed": True,
+                "vector_required": False,
+            },
+        ]
+        self.enqueued: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, statement, params=None) -> None:
+        sql = " ".join(statement.split())
+        if sql.startswith("UPDATE documents SET index_required = TRUE, vector_index_required = TRUE"):
+            selective = "embedding_model_name IS NULL" in sql or "vector_indexed_at IS NULL" in sql
+            for document in self.documents:
+                eligible = document["enabled"] and not document["deleted"]
+                stale = not document["vector_indexed"] or document["embedding_model_name"] != "bge-m3"
+                if eligible and (not selective or stale):
+                    document["vector_required"] = True
+            return
+        if sql.startswith("INSERT INTO reindex_items"):
+            self.enqueued = [
+                document["id"]
+                for document in self.documents
+                if document["enabled"] and not document["deleted"] and document["vector_required"]
+            ]
+
+
+class _CreateJobRegistry(DocumentRegistry):
+    def __init__(self) -> None:
+        super().__init__("postgresql://unused")
+        self._cursor = _CreateJobCursor()
+
+    def _connect(self):
+        return _Connection(self._cursor)
+
+    def _require_domain(self, domain: str):
+        return domain, {}
+
+    def _lock_domain_document_mutations(self, cur, domain: str) -> None:
+        pass
+
+    def _raise_if_clear_active(self, cur, domain: str) -> None:
+        pass
+
+    def _refresh_reindex_summary(self, cur, job_id: str) -> None:
+        pass
+
+    def get_reindex_job(self, job_id: str) -> dict:
+        return {"id": job_id, "documents": list(self._cursor.enqueued)}
+
+    def list_domains(self) -> list[dict]:
+        return [{"domain_key": "docs", "embedding_model_name": "bge-m3"}]
+
+
 class ReindexControlRegistryTest(unittest.TestCase):
+    def test_full_vector_rebuild_enqueues_already_indexed_current_model_document(self) -> None:
+        registry = _CreateJobRegistry()
+
+        job = registry.create_reindex_job("docs", mark_all=True, index_target="vector")
+
+        self.assertEqual(job["documents"], ["already-indexed", "changed"])
+
+    def test_changed_only_vector_job_only_enqueues_documents_already_marked_changed(self) -> None:
+        registry = _CreateJobRegistry()
+
+        job = registry.create_reindex_job("docs", index_target="vector")
+
+        self.assertEqual(job["documents"], ["changed"])
+
     def test_transition_states_are_schema_valid_and_block_clear(self) -> None:
         for status in ("pausing", "paused", "cancelling"):
             self.assertIn(f"'{status}'", registry_module.REINDEX_SCHEMA_SQL)

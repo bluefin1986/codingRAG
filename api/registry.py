@@ -941,6 +941,43 @@ class DocumentRegistry:
             job["items"] = list(cur.fetchall())
             return job
 
+    def list_ingest_job_failures(self, job_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        """Return a bounded page of durable per-file failures for one ingest job."""
+        self.init_schema()
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
+            if not cur.fetchone():
+                raise KeyError(job_id)
+            cur.execute(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM knowledge_ingest_items
+                WHERE job_id = %s AND status = 'failed'
+                """,
+                [job_id],
+            )
+            total = cur.fetchone()["count"]
+            cur.execute(
+                """
+                SELECT id, relative_path, status, error_message, created_at, updated_at
+                FROM knowledge_ingest_items
+                WHERE job_id = %s AND status = 'failed'
+                ORDER BY updated_at DESC, relative_path
+                LIMIT %s OFFSET %s
+                """,
+                [job_id, limit, offset],
+            )
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "items": list(cur.fetchall()),
+            }
+
     def retry_ingest_job(self, job_id: str) -> dict[str, Any]:
         self.init_schema()
         with self._connect() as conn, conn.cursor() as cur:
@@ -1320,6 +1357,13 @@ class DocumentRegistry:
                         self._refresh_ingest_summary(cur, job_id)
                         conn.commit()
                 except Exception as exc:
+                    logger.exception(
+                        "Ingest item failed job_id=%s item_id=%s relative_path=%s: %s",
+                        job_id,
+                        item["id"],
+                        item["relative_path"],
+                        exc,
+                    )
                     with self._connect() as conn, conn.cursor() as cur:
                         cur.execute("SELECT status FROM knowledge_ingest_jobs WHERE id = %s FOR UPDATE", [job_id])
                         state = cur.fetchone()
@@ -1393,21 +1437,7 @@ class DocumentRegistry:
             self._lock_domain_document_mutations(cur, domain)
             self._raise_if_clear_active(cur, domain)
             if mark_all:
-                # Get domain's current embedding model name for comparison
-                domain_item = next((d for d in self.list_domains() if d["domain_key"] == domain), None)
-                target_model = (domain_item or {}).get("embedding_model_name", "")
-                if index_target in {"both", "vector"} and target_model:
-                    # Only mark docs whose current embedding model differs from target
-                    cur.execute(
-                        """
-                        UPDATE documents
-                        SET index_required = TRUE, vector_index_required = TRUE, updated_at = now()
-                        WHERE domain = %s AND enabled = TRUE AND deleted_at IS NULL
-                          AND (embedding_model_name IS NULL OR embedding_model_name != %s OR vector_indexed_at IS NULL)
-                        """,
-                        [domain, target_model],
-                    )
-                elif index_target in {"both", "vector"}:
+                if index_target in {"both", "vector"}:
                     cur.execute(
                         """
                         UPDATE documents
@@ -3621,6 +3651,8 @@ CREATE TABLE IF NOT EXISTS knowledge_ingest_items (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_job_id ON knowledge_ingest_items(job_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_status ON knowledge_ingest_items(status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_items_job_status_updated
+    ON knowledge_ingest_items(job_id, status, updated_at DESC);
 """
 
 REINDEX_SCHEMA_SQL = """

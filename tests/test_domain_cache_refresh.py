@@ -269,7 +269,9 @@ class DomainCacheRefreshTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             missing_path = str(Path(directory) / "missing.md")
             registry = _MissingSourceRegistry(missing_path)
-            with patch.object(registry_module, "create_storage", return_value=object()):
+            with patch.object(registry_module, "create_storage", return_value=object()), self.assertLogs(
+                "api.registry", level="ERROR"
+            ) as logs:
                 registry._run_ingest_items("ingest-1", batch_size=1)
 
         parent_lock = next(
@@ -283,6 +285,8 @@ class DomainCacheRefreshTest(unittest.TestCase):
             if sql.startswith("UPDATE knowledge_ingest_items SET status = 'failed'")
         )
         self.assertLess(parent_lock, failed_item_update)
+        self.assertIn("job_id=ingest-1", logs.output[0])
+        self.assertIn("relative_path=missing.md", logs.output[0])
 
     def test_reindex_job_refreshes_cached_update_before_indexing(self) -> None:
         cache = DomainCache("postgresql://unused")
