@@ -1752,7 +1752,25 @@ class DocumentRegistry:
                     break
                 document_id = str(item["document_id"])
                 try:
+                    logger.info(
+                        "Reindex job item start job_id=%s document_id=%s target=%s",
+                        job_id,
+                        document_id,
+                        job["index_target"],
+                    )
                     result = indexer.index_document(document_id, target=str(job["index_target"]))
+                    logger.info(
+                        "Reindex job item complete job_id=%s document_id=%s domain=%s target=%s collection=%s "
+                        "embedding_model_name=%s vector_indexed=%s bm25_indexed=%s",
+                        job_id,
+                        document_id,
+                        result.get("domain", ""),
+                        job["index_target"],
+                        result.get("collection", ""),
+                        result.get("embedding_model_name") or "not_applicable",
+                        bool(result.get("vector_indexed")),
+                        bool(result.get("bm25_indexed")),
+                    )
                     with self._connect() as conn, conn.cursor() as cur:
                         cur.execute(
                             """

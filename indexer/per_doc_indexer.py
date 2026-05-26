@@ -377,15 +377,33 @@ class PerDocumentIndexer:
         if target in {"both", "vector"}:
             try:
                 texts = [truncate_text(chunk.text) for chunk in chunks]
-                embeddings = (
-                    embed_texts(
+                if texts:
+                    logger.info(
+                        "Embedding request start domain=%s document_id=%s target=%s collection=%s "
+                        "embedding_model_name=%s text_count=%d",
+                        document["domain"],
+                        doc_id,
+                        target,
+                        collection,
+                        cfg["embedding_model_name"],
+                        len(texts),
+                    )
+                    embeddings = embed_texts(
                         texts,
                         api_base=EMBEDDING_API_BASE,
                         model_name=cfg["embedding_model_name"],
                     )
-                    if texts
-                    else []
-                )
+                else:
+                    logger.info(
+                        "Embedding request skipped domain=%s document_id=%s target=%s collection=%s "
+                        "embedding_model_name=%s reason=no_texts",
+                        document["domain"],
+                        doc_id,
+                        target,
+                        collection,
+                        cfg["embedding_model_name"],
+                    )
+                    embeddings = []
                 if len(embeddings) != len(chunks):
                     raise RuntimeError(f"Embedding count mismatch: chunks={len(chunks)} vectors={len(embeddings)}")
                 points = self._build_points(document, chunks, embeddings)
@@ -400,12 +418,30 @@ class PerDocumentIndexer:
                     embedding_model=cfg.get("embedding_model", ""),
                     embedding_model_name=cfg.get("embedding_model_name", ""),
                 )
+                logger.info(
+                    "Vector indexing complete domain=%s document_id=%s target=%s collection=%s "
+                    "embedding_model_name=%s vector_count=%d",
+                    document["domain"],
+                    doc_id,
+                    target,
+                    collection,
+                    cfg["embedding_model_name"],
+                    vector_count,
+                )
             except Exception as exc:
                 self._mark_vector_failed(doc_id, exc)
                 raise
 
         if target in {"both", "bm25"}:
             try:
+                logger.info(
+                    "BM25 indexing start domain=%s document_id=%s target=%s collection=%s "
+                    "embedding_model_name=not_applicable",
+                    document["domain"],
+                    doc_id,
+                    target,
+                    collection,
+                )
                 es_indexer = self._get_es_indexer(document)
                 if es_indexer is None:
                     raise RuntimeError("BM25/OpenSearch indexing is not configured for this library")
@@ -415,6 +451,15 @@ class PerDocumentIndexer:
                 finally:
                     es_indexer.close()
                 self._mark_bm25_indexed(doc_id, bm25_count)
+                logger.info(
+                    "BM25 indexing complete domain=%s document_id=%s target=%s collection=%s "
+                    "embedding_model_name=not_applicable chunk_count=%d",
+                    document["domain"],
+                    doc_id,
+                    target,
+                    collection,
+                    bm25_count,
+                )
             except Exception as exc:
                 self._mark_bm25_failed(doc_id, exc)
                 raise
@@ -428,6 +473,7 @@ class PerDocumentIndexer:
             "vector_chunk_count": vector_count,
             "bm25_chunk_count": bm25_count,
             "index_target": target,
+            "embedding_model_name": cfg["embedding_model_name"] if target in {"both", "vector"} else None,
             "vector_indexed": target in {"both", "vector"},
             "bm25_indexed": target in {"both", "bm25"},
             "status": "indexed",
