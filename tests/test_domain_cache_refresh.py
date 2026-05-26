@@ -300,17 +300,29 @@ class DomainCacheRefreshTest(unittest.TestCase):
 
             def index_document(self, document_id: str, *, target: str) -> dict:
                 observed_collections.append(get_domain_config("docs")["collection"])
-                return {"vector_indexed": True, "bm25_indexed": False}
+                return {
+                    "domain": "docs",
+                    "collection": "updated-collection",
+                    "embedding_model_name": "bge-large-zh-v1.5",
+                    "vector_indexed": True,
+                    "bm25_indexed": False,
+                }
 
         registry = _ReindexRegistry()
         with patch.object(registry_module, "domain_cache", cache), patch.object(
             cache, "load", side_effect=load_updated_domain
         ) as load, patch("indexer.per_doc_indexer.PerDocumentIndexer", _Indexer):
-            result = registry.run_reindex_job("job-1")
+            with self.assertLogs("api.registry", level="INFO") as logs:
+                result = registry.run_reindex_job("job-1")
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(observed_collections, ["updated-collection"])
         load.assert_called_once_with()
+        self.assertIn(
+            "Reindex job item complete job_id=job-1 document_id=doc-1 domain=docs target=vector "
+            "collection=updated-collection embedding_model_name=bge-large-zh-v1.5",
+            "\n".join(logs.output),
+        )
 
 
 if __name__ == "__main__":
