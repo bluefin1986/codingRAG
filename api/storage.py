@@ -38,6 +38,9 @@ class ObjectStorage:
     def read_text(self, storage_path: str, *, storage_key: str | None = None, encoding: str = "utf-8") -> str:
         return Path(storage_path).read_text(encoding=encoding, errors="replace")
 
+    def delete_object(self, storage_path: str, *, storage_key: str | None = None) -> None:
+        raise NotImplementedError
+
 
 class LocalObjectStorage(ObjectStorage):
     backend = "local"
@@ -62,6 +65,11 @@ class LocalObjectStorage(ObjectStorage):
             storage_size=resolved.stat().st_size,
             storage_etag=digest,
         )
+
+    def delete_object(self, storage_path: str, *, storage_key: str | None = None) -> None:
+        target = Path(storage_path or (self.root_dir / (storage_key or ""))).expanduser()
+        if target.exists():
+            target.unlink()
 
 
 class SeaweedFSObjectStorage(ObjectStorage):
@@ -154,6 +162,20 @@ class SeaweedFSObjectStorage(ObjectStorage):
                 return response.text
 
         raise FileNotFoundError(storage_path or storage_key or "<empty storage reference>")
+
+    def delete_object(self, storage_path: str, *, storage_key: str | None = None) -> None:
+        local_path = Path(storage_path).expanduser() if storage_path and not urlparse(storage_path).scheme else None
+        remote_url = self._remote_url(storage_path, storage_key)
+        if remote_url:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True, trust_env=False) as client:
+                response = client.delete(remote_url)
+                if response.status_code not in (200, 202, 204, 404):
+                    response.raise_for_status()
+            return
+        if local_path:
+            self._local.delete_object(str(local_path), storage_key=storage_key)
+            return
+        raise ValueError("SeaweedFS object reference is empty")
 
     def _object_key(self, *, relative_path: str, digest: str) -> str:
         normalized_relative = "/".join(_safe_path_segment(part) for part in Path(relative_path).as_posix().split("/") if part)

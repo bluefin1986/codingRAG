@@ -448,7 +448,7 @@ class DocumentRegistry:
                 row["latest_ingest_job"] = cur.fetchone()
                 cur.execute(
                     """
-                    SELECT id, domain, status, total, deleted, error_message,
+                    SELECT id, domain, status, total, deleted, summary, error_message,
                            created_at, updated_at, started_at, finished_at
                     FROM knowledge_clear_jobs
                     WHERE domain = %s
@@ -560,7 +560,7 @@ class DocumentRegistry:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT id, domain, status, total, deleted, error_message,
+                SELECT id, domain, status, total, deleted, summary, error_message,
                        created_at, updated_at, started_at, finished_at
                 FROM knowledge_clear_jobs
                 {where}
@@ -593,7 +593,7 @@ class DocumentRegistry:
         return [self.run_knowledge_base_clear_job(job_id) for job_id in job_ids]
 
     def run_knowledge_base_clear_job(self, job_id: str) -> dict[str, Any]:
-        """Delete derived indexes once per domain, then hide all current documents."""
+        """Delete derived indexes and original objects, then hide current documents."""
         from indexer.per_doc_indexer import PerDocumentIndexer
 
         self.init_schema()
@@ -618,6 +618,7 @@ class DocumentRegistry:
         domain = str(claimed["domain"])
         try:
             PerDocumentIndexer(self.database_url).delete_domain_index(domain)
+            storage_summary = self._delete_knowledge_base_version_objects(domain)
             with self._connect() as conn, conn.cursor() as cur:
                 self._lock_domain_document_mutations(cur, domain)
                 cur.execute(
@@ -640,10 +641,11 @@ class DocumentRegistry:
                 cur.execute(
                     """
                     UPDATE knowledge_clear_jobs
-                    SET status = 'completed', deleted = %s, finished_at = now(), updated_at = now()
+                    SET status = 'completed', deleted = %s, summary = %s::jsonb,
+                        finished_at = now(), updated_at = now()
                     WHERE id = %s
                     """,
-                    [deleted, job_id],
+                    [deleted, Jsonb(to_jsonable(storage_summary)), job_id],
                 )
                 conn.commit()
             return self.get_knowledge_base_clear_job(job_id) or {}
@@ -660,6 +662,85 @@ class DocumentRegistry:
                 )
                 conn.commit()
             raise
+
+    def _delete_knowledge_base_version_objects(self, domain: str) -> dict[str, int]:
+        """Physically remove unshared originals for a domain and retire its version references."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dv.id, dv.storage_backend, dv.storage_path, dv.storage_key, dv.storage_status,
+                       EXISTS (
+                         SELECT 1
+                         FROM document_versions other
+                         JOIN documents od ON od.id = other.document_id
+                         JOIN doc_libraries ol ON ol.id = od.library_id
+                         WHERE other.id != dv.id
+                           AND other.storage_status = 'active'
+                           AND other.storage_backend = dv.storage_backend
+                           AND COALESCE(other.storage_path, '') = COALESCE(dv.storage_path, '')
+                           AND COALESCE(other.storage_key, '') = COALESCE(dv.storage_key, '')
+                           AND NOT (ol.code = %s AND ol.domain = %s)
+                       ) AS shared_outside_domain
+                FROM document_versions dv
+                JOIN documents d ON d.id = dv.document_id
+                JOIN doc_libraries l ON l.id = d.library_id
+                WHERE l.code = %s AND l.domain = %s
+                  AND dv.storage_status IN ('active', 'missing')
+                ORDER BY dv.created_at, dv.id
+                """,
+                [domain, domain, domain, domain],
+            )
+            versions = list(cur.fetchall())
+
+        unique_objects: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for version in versions:
+            reference = (
+                str(version.get("storage_backend") or "local"),
+                str(version.get("storage_path") or ""),
+                str(version.get("storage_key") or ""),
+            )
+            existing = unique_objects.setdefault(reference, {"versions": [], "shared": False})
+            existing["versions"].append(str(version["id"]))
+            existing["shared"] = bool(existing["shared"] or version.get("shared_outside_domain"))
+
+        objects_deleted = 0
+        objects_retained_shared = 0
+        version_ids: list[str] = []
+        for (backend, path, key), record in unique_objects.items():
+            if record["shared"]:
+                objects_retained_shared += 1
+            else:
+                storage_backend = backend
+                if backend == "seaweedfs" and path and not path.startswith(("http://", "https://")):
+                    storage_backend = "local"
+                storage = create_storage(
+                    storage_backend,
+                    seaweedfs_filer_url=CODING_RAG_SEAWEEDFS_FILER_URL,
+                    seaweedfs_public_base_url=CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL,
+                    seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
+                    seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
+                )
+                storage.delete_object(path, storage_key=key or None)
+                objects_deleted += 1
+            version_ids.extend(record["versions"])
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE document_versions
+                SET storage_status = 'deleted'
+                WHERE id = ANY(%s::uuid[]) AND storage_status IN ('active', 'missing')
+                RETURNING id
+                """,
+                [version_ids],
+            )
+            versions_deleted = len(cur.fetchall())
+            conn.commit()
+        return {
+            "objects_total": len(unique_objects),
+            "objects_deleted": objects_deleted,
+            "objects_retained_shared": objects_retained_shared,
+            "versions_deleted": versions_deleted,
+        }
 
     def create_ingest_job(self, domain: str, *, source_type: str = "files", batch_size: int | None = None) -> dict[str, Any]:
         """Create one registration-only async job targeting the primary domain library."""
@@ -3495,6 +3576,7 @@ CREATE TABLE IF NOT EXISTS knowledge_clear_jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     total INTEGER NOT NULL DEFAULT 0,
     deleted INTEGER NOT NULL DEFAULT 0,
+    summary JSONB NOT NULL DEFAULT '{}'::jsonb,
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -3506,4 +3588,5 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_clear_jobs_domain ON knowledge_clear_jo
 CREATE INDEX IF NOT EXISTS idx_knowledge_clear_jobs_status ON knowledge_clear_jobs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_clear_jobs_active_domain
 ON knowledge_clear_jobs(domain) WHERE status IN ('pending', 'running');
+ALTER TABLE knowledge_clear_jobs ADD COLUMN IF NOT EXISTS summary JSONB NOT NULL DEFAULT '{}'::jsonb;
 """
