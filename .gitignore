@@ -5,3 +5,4 @@ data/
 .iflycode/
 # Generated chunk/index artifacts
 output/
+.venv/
