@@ -1,4 +1,7 @@
 FROM python:3.12-slim
+
+LABEL version="1.0.1"
+LABEL maintainer="codingRAG"
 WORKDIR /app
 
 # Use a more stable Debian mirror and retry apt downloads.

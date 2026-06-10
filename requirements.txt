@@ -12,3 +12,6 @@ uvicorn>=0.32.0
 psycopg[binary]>=3.2.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
+protobuf>=4.25.0

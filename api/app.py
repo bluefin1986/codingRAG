@@ -69,7 +69,7 @@ logger = logging.getLogger("codingrag.api")
 
 app = FastAPI(
     title="codingRAG API",
-    version="0.1.0",
+    version="1.0.1",
     description="codingRAG 检索接口，供 llmproxy 等上游调用。",
 )
 
@@ -160,6 +160,13 @@ def health():
         "default_domain": ACTIVE_DOMAIN,
         "available_domains": [item["domain_key"] for item in domain_cache.list_domains()],
     }
+
+
+@app.get("/api/docreader/health")
+def docreader_health():
+    """检查 DocReader 服务连接状态。"""
+    from api.docreader.client import check_health
+    return check_health()
 
 
 @app.get("/api/domains", response_model=list[DomainItem])

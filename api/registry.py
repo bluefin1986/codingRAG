@@ -32,8 +32,15 @@ from config import (
     get_domain_config,
 )
 from api.storage import create_storage
+from api.docreader.client import (
+    DOCREADER_EXTENSIONS,
+    convert_to_markdown,
+    is_available as docreader_available,
+)
 
 TEXT_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".html", ".htm", ".rst"}
+# 所有支持的扩展名（文本 + DocReader 可转换的）
+ALL_SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | DOCREADER_EXTENSIONS
 DEFAULT_RETENTION_VERSIONS = 2
 INGEST_STAGING_ROOT = Path(__file__).resolve().parents[1] / "output" / "ingest-jobs"
 logger = logging.getLogger(__name__)
@@ -786,10 +793,31 @@ class DocumentRegistry:
                 continue
             if rel in seen:
                 raise ValueError(f"duplicate relative_path in upload: {rel}")
-            if Path(rel).suffix.lower() not in TEXT_EXTENSIONS:
+            ext = Path(rel).suffix.lower()
+            if ext not in ALL_SUPPORTED_EXTENSIONS:
                 raise ValueError(f"unsupported document extension: {rel}")
-            seen.add(rel)
-            normalized.append((rel, content))
+            # 非文本文件：通过 DocReader 转换为 Markdown
+            if ext in DOCREADER_EXTENSIONS:
+                if not docreader_available():
+                    raise ValueError(
+                        f"文件格式 {ext} 需要 DocReader 服务，但 CODING_RAG_DOCREADER_ADDR 未配置"
+                    )
+                try:
+                    md_content = convert_to_markdown(
+                        file_name=Path(rel).name,
+                        file_type=ext,
+                        file_content=content,
+                    )
+                except Exception as e:
+                    raise ValueError(f"DocReader 转换失败 ({rel}): {e}") from e
+                # 转换后以 .md 保存，保留原始文件名作前缀
+                md_rel = str(Path(rel).with_suffix(".md"))
+                seen.add(rel)
+                normalized.append((md_rel, md_content.encode("utf-8")))
+                logger.info("DocReader 转换: %s -> %s (%d bytes markdown)", rel, md_rel, len(md_content))
+            else:
+                seen.add(rel)
+                normalized.append((rel, content))
 
         staging_root = (INGEST_STAGING_ROOT / job_id / "uploads").resolve()
         with self._connect() as conn, conn.cursor() as cur:
@@ -3217,9 +3245,35 @@ def build_library_search_config(domain: str, cfg: dict[str, Any]) -> dict[str, A
 
 
 def iter_document_files(root: Path) -> Iterable[Path]:
+    """Iterate over supported document files in root.
+
+    For text extensions, yields the file directly.
+    For DocReader-supported extensions (docx, pdf, xlsx, etc.),
+    converts to markdown via DocReader and yields a temporary .md file.
+    """
+    from api.docreader.client import DOCREADER_EXTENSIONS, convert_to_markdown, is_available as docreader_available
+
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() in TEXT_EXTENSIONS and not path.name.startswith("."):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        ext = path.suffix.lower()
+        if ext in TEXT_EXTENSIONS:
             yield path
+        elif ext in DOCREADER_EXTENSIONS and docreader_available():
+            try:
+                content = path.read_bytes()
+                md = convert_to_markdown(
+                    file_name=path.name,
+                    file_type=ext,
+                    file_content=content,
+                )
+                # 写入临时 .md 文件
+                tmp_path = path.with_suffix(path.suffix + ".md")
+                tmp_path.write_text(md, encoding="utf-8")
+                logger.info("DocReader 转换(扫描): %s -> %s", path.name, tmp_path.name)
+                yield tmp_path
+            except Exception:
+                logger.exception("DocReader 转换失败，跳过: %s", path)
 
 
 def validate_ingest_relative_path(value: str) -> str:

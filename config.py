@@ -78,6 +78,10 @@ def get_domain_config(domain: str | None = None) -> Dict[str, Any]:
     return cfg
 
 
+# ── DocReader（WeKnora 文档解析服务） ──
+DOCREADER_ADDR = os.getenv("CODING_RAG_DOCREADER_ADDR", "").strip()
+DOCREADER_TIMEOUT = int(os.getenv("CODING_RAG_DOCREADER_TIMEOUT", "120"))
+
 # ── Chunking ──
 CHUNK_MAX_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MAX_TOKENS", "800"))
 CHUNK_MIN_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MIN_TOKENS", "200"))
