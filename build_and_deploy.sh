@@ -8,25 +8,52 @@ if [ -f .env ]; then
   set +a
 fi
 
+# 参数解析
+FULL_DEPLOY=false
+for arg in "$@"; do
+  case "$arg" in
+    --full|-f) FULL_DEPLOY=true ;;
+    --help|-h)
+      echo "用法: $0 [--full]"
+      echo "  --full, -f  完整部署（包含中间件：postgres, opensearch, qdrant, seaweedfs）"
+      echo "  默认        只部署主 app（codingrag-api + workers）"
+      exit 0
+      ;;
+  esac
+done
+
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 TAR_NAME="${TAR_NAME:-codingrag-images.tar}"
-REMOTE="${REMOTE:-docker126_rag:/data/rag/container/}"
+REMOTE="${REMOTE:-codingRAG126_rag:/data/rag/container/}"
 
 # 两层密码，从环境变量读取
 PASS1="${RSYNC_PASS1:?请设置 RSYNC_PASS1}"
 PASS2="${RSYNC_PASS2:?请设置 RSYNC_PASS2}"
 
-echo "==> docker compose build"
-docker compose -f "$COMPOSE_FILE" build
+# 主 app 镜像名
+CODINGRAG_IMAGE="${CODINGRAG_IMAGE:-codingrag:latest}"
 
-echo "==> 获取 compose 镜像列表"
-IMAGES=()
-while IFS= read -r image; do
-  [ -n "$image" ] && IMAGES+=("$image")
-done < <(docker compose -f "$COMPOSE_FILE" config --images | sort -u)
+if [ "$FULL_DEPLOY" = true ]; then
+  echo "==> 完整部署模式（包含中间件）"
+  echo "==> docker compose build (all)"
+  docker compose -f "$COMPOSE_FILE" build
+  
+  echo "==> 获取所有 compose 镜像"
+  IMAGES=()
+  while IFS= read -r image; do
+    [ -n "$image" ] && IMAGES+=("$image")
+  done < <(docker compose -f "$COMPOSE_FILE" config --images | sort -u)
+else
+  echo "==> 快速部署模式（只部署主 app）"
+  echo "==> docker compose build app"
+  docker compose -f "$COMPOSE_FILE" build app library-import-worker reindex-worker
+  
+  # 只保存主 app 镜像
+  IMAGES=("$CODINGRAG_IMAGE")
+fi
 
 if [ "${#IMAGES[@]}" -eq 0 ]; then
-  echo "未找到 compose 镜像"
+  echo "未找到镜像"
   exit 1
 fi
 
@@ -45,6 +72,9 @@ REMOTE_HOST="${REMOTE%%:*}"
 REMOTE_DIR="${REMOTE#*:}"
 REMOTE_TAR_PATH="${REMOTE_DIR%/}/$TAR_NAME"
 DEPLOY_DIR="${DEPLOY_DIR:-/data/rag/codingrag}"
+
+# 清除代理，避免 rsync/ssh 被拦截
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 
 PASS1="$PASS1" PASS2="$PASS2" TAR_NAME="$TAR_NAME" REMOTE="$REMOTE" /usr/bin/expect <<'EOF'
 set timeout -1
@@ -76,16 +106,23 @@ EOF
 
 echo "==> ssh 到 $REMOTE_HOST 执行 docker load 和 docker-compose up"
 
-PASS1="$PASS1" PASS2="$PASS2" REMOTE_HOST="$REMOTE_HOST" DEPLOY_DIR="$DEPLOY_DIR" REMOTE_TAR_PATH="$REMOTE_TAR_PATH" /usr/bin/expect <<'EOF'
+if [ "$FULL_DEPLOY" = true ]; then
+  # 完整部署：force-recreate 所有服务
+  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker-compose up -d --force-recreate"
+else
+  # 快速部署：只重启主 app 服务
+  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker-compose up -d --force-recreate app library-import-worker reindex-worker"
+fi
+
+PASS1="$PASS1" PASS2="$PASS2" REMOTE_HOST="$REMOTE_HOST" DEPLOY_CMD="$DEPLOY_CMD" /usr/bin/expect <<EOF
 set timeout -1
-set pass1 $env(PASS1)
-set pass2 $env(PASS2)
-set remote_host $env(REMOTE_HOST)
-set deploy_dir $env(DEPLOY_DIR)
-set remote_tar_path $env(REMOTE_TAR_PATH)
+set pass1 \$env(PASS1)
+set pass2 \$env(PASS2)
+set remote_host \$env(REMOTE_HOST)
+set deploy_cmd \$env(DEPLOY_CMD)
 set auth_count 0
 
-spawn ssh $remote_host "cd '$deploy_dir' && docker load < '$remote_tar_path' && docker-compose up -d --force-recreate"
+spawn ssh \$remote_host \$deploy_cmd
 
 expect {
   -re "(?i).*are you sure you want to continue connecting.*" {
@@ -94,10 +131,10 @@ expect {
   }
   -re "(?i).*(password|passphrase|密码|verification|second|二次|otp|code|动态|验证码|二级|第二).*" {
     incr auth_count
-    if {$auth_count == 1} {
-      send -- "$pass1\r"
+    if {\$auth_count == 1} {
+      send -- "\$pass1\r"
     } else {
-      send -- "$pass2\r"
+      send -- "\$pass2\r"
     }
     exp_continue
   }

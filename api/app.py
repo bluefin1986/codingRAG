@@ -1072,6 +1072,44 @@ def _build_trace_stage(raw: dict) -> TraceStage:
     return TraceStage(count=raw.get("count", 0), top=entries)
 
 
+@app.delete("/api/docs/{document_id}")
+def delete_document(document_id: str):
+    """Delete a single document and its indexes."""
+    try:
+        # First delete the index
+        PerDocumentIndexer().delete_document_index(document_id)
+        # Then soft-delete the document record
+        registry = _get_registry()
+        registry.init_schema()
+        with registry._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET enabled = FALSE, status = 'deleted', deleted_at = now(),
+                    indexed_at = NULL, chunk_count = 0, index_required = FALSE,
+                    vector_indexed_at = NULL, vector_chunk_count = 0, vector_index_required = FALSE,
+                    bm25_indexed_at = NULL, bm25_chunk_count = 0, bm25_index_required = FALSE,
+                    error_message = NULL, vector_error_message = NULL, bm25_error_message = NULL,
+                    updated_at = now()
+                WHERE id = %s::uuid AND deleted_at IS NULL
+                RETURNING id, domain
+                """,
+                [document_id],
+            )
+            row = cur.fetchone()
+            conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return {"deleted": True, "id": str(row["id"]), "domain": row["domain"]}
+    except DocumentNotFound:
+        raise HTTPException(status_code=404, detail="Document not found")
+    except RegistryUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.exception("delete_document failed for document_id=%s", document_id)
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
+
 if __name__ == "__main__":
     import uvicorn
 

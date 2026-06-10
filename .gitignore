@@ -6,3 +6,4 @@ data/
 # Generated chunk/index artifacts
 output/
 .venv/
+*.tar
