@@ -86,3 +86,9 @@ DOCREADER_TIMEOUT = int(os.getenv("CODING_RAG_DOCREADER_TIMEOUT", "120"))
 CHUNK_MAX_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MAX_TOKENS", "800"))
 CHUNK_MIN_TOKENS = int(os.getenv("CODING_RAG_CHUNK_MIN_TOKENS", "200"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CODING_RAG_CHUNK_OVERLAP_TOKENS", "100"))
+
+# ── Context Expansion（召回后上下文扩展） ──
+# 命中 chunk 向前后各扩展 N 个相邻 chunk（默认 5）
+CONTEXT_WINDOW = int(os.getenv("CODING_RAG_CONTEXT_WINDOW", "5"))
+# 单条结果最大字符数（默认 12000）
+CONTEXT_MAX_CHARS = int(os.getenv("CODING_RAG_CONTEXT_MAX_CHARS", "12000"))

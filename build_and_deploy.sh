@@ -71,7 +71,7 @@ fi
 REMOTE_HOST="${REMOTE%%:*}"
 REMOTE_DIR="${REMOTE#*:}"
 REMOTE_TAR_PATH="${REMOTE_DIR%/}/$TAR_NAME"
-DEPLOY_DIR="${DEPLOY_DIR:-/data/rag/codingrag}"
+DEPLOY_DIR="${DEPLOY_DIR:-/data/rag/codingRAG}"
 
 # 清除代理，避免 rsync/ssh 被拦截
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy

@@ -463,71 +463,118 @@ def _chunk_lookup(chunks: list) -> tuple[dict[tuple, dict], dict[str, list[dict]
     return by_key, by_source
 
 
-def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int = 1, max_chars_per_result: int = 6000) -> List[dict]:
-    """Expand each hit with adjacent chunks from the same source document.
+def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int = 5, max_chars_per_result: int = 12000) -> List[dict]:
+    """Expand hits with adjacent chunks, merging overlapping ranges per document.
 
-    The API still returns topK results, but each result.text becomes a more useful
-    local document window for the LLM. This avoids forcing clients to read md files.
+    Improvements over the original:
+    - Groups results by source_file, merges overlapping ±window ranges
+    - Avoids duplicate content when topK has adjacent chunks from the same doc
+    - Configurable via CODING_RAG_CONTEXT_WINDOW / CODING_RAG_CONTEXT_MAX_CHARS
     """
+    import os
+    window = int(os.getenv("CODING_RAG_CONTEXT_WINDOW", str(window)))
+    max_chars = int(os.getenv("CODING_RAG_CONTEXT_MAX_CHARS", str(max_chars_per_result)))
+
     _, chunks = _load_keyword_searcher_for_domain(cfg)
     if not chunks:
         return results
 
     by_key, by_source = _chunk_lookup(chunks)
-    expanded: list[dict] = []
+
+    # ── 1. 按 source_file 分组，收集命中的 chunk_index ──
+    groups: dict[str, list[dict]] = {}  # source_file -> [result, ...]
     for r in results:
         source = r.get("source_file", "")
-        chunk_idx = r.get("chunk_index")
-        item = by_key.get((source, chunk_idx)) if chunk_idx is not None else None
-        if item is None:
-            # Fallback for legacy results without chunk_index.
-            for candidate in by_source.get(source, []):
-                meta = candidate["record"].get("metadata", {}) or {}
-                if meta.get("context", "") == r.get("context", ""):
-                    item = candidate
-                    break
-        if item is None:
-            expanded.append(r)
-            continue
+        groups.setdefault(source, []).append(r)
 
+    expanded: list[dict] = []
+
+    for source, group_results in groups.items():
         source_items = by_source.get(source, [])
-        center_i = next((i for i, candidate in enumerate(source_items) if candidate is item), -1)
-        if center_i < 0:
-            expanded.append(r)
+        if not source_items:
+            # 无法定位 chunk，原样返回
+            expanded.extend(group_results)
             continue
 
-        selected = source_items[max(0, center_i - window): center_i + window + 1]
-        texts = []
-        contexts = []
-        total = 0
-        for selected_item in selected:
-            record = selected_item["record"]
-            text = record.get("text", "") or ""
-            meta = record.get("metadata", {}) or {}
-            if not text:
-                continue
-            if total + len(text) > max_chars_per_result and texts:
-                break
-            texts.append(text)
-            contexts.append(meta.get("context", ""))
-            total += len(text)
+        # ── 2. 收集所有命中的 chunk 在 source_items 中的 index ──
+        hit_indices: set[int] = set()
+        best_r = group_results[0]  # 保留得分最高的作为主 result
+        for r in group_results:
+            chunk_idx = r.get("chunk_index")
+            item = by_key.get((source, chunk_idx)) if chunk_idx is not None else None
+            if item is None:
+                # fallback: 按 context 匹配
+                for candidate in source_items:
+                    meta = candidate["record"].get("metadata", {}) or {}
+                    if meta.get("context", "") == r.get("context", ""):
+                        item = candidate
+                        break
+            if item is not None:
+                center_i = next((i for i, c in enumerate(source_items) if c is item), -1)
+                if center_i >= 0:
+                    hit_indices.add(center_i)
+            # 更新 best_r（取 score 最高的）
+            if float(r.get("score", 0) or 0) > float(best_r.get("score", 0) or 0):
+                best_r = r
 
-        new_r = r.copy()
+        if not hit_indices:
+            expanded.extend(group_results)
+            continue
+
+        # ── 3. 对每个命中位置扩展 ±window，得到区间集合 ──
+        ranges: list[tuple[int, int]] = []
+        for idx in sorted(hit_indices):
+            lo = max(0, idx - window)
+            hi = min(len(source_items) - 1, idx + window)
+            ranges.append((lo, hi))
+
+        # ── 4. 合并重叠区间 ──
+        ranges.sort()
+        merged: list[tuple[int, int]] = [ranges[0]]
+        for lo, hi in ranges[1:]:
+            if lo <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+
+        # ── 5. 拼接文本，受 max_chars 限制 ──
+        texts: list[str] = []
+        contexts: list[str] = []
+        total = 0
+        for lo, hi in merged:
+            for i in range(lo, hi + 1):
+                record = source_items[i]["record"]
+                text = record.get("text", "") or ""
+                meta = record.get("metadata", {}) or {}
+                if not text:
+                    continue
+                if total + len(text) > max_chars and texts:
+                    break
+                texts.append(text)
+                contexts.append(meta.get("context", ""))
+                total += len(text)
+            if total >= max_chars:
+                break
+
+        new_r = best_r.copy()
         if texts:
             new_r["text"] = "\n\n".join(texts)
             new_r["expanded_chunks"] = len(texts)
             new_r["expanded_contexts"] = contexts
+            new_r["merged_ranges"] = len(merged)
         expanded.append(new_r)
 
     logger.info(
-        "RAG_CONTEXT_EXPAND domain=%s results=%d expanded=%s",
+        "RAG_CONTEXT_EXPAND domain=%s input=%d output=%d expanded=%s",
         cfg.get("domain"),
+        len(results),
         len(expanded),
         [
             {
                 "source_file": r.get("source_file", ""),
                 "context": r.get("context", "")[:80],
                 "expanded_chunks": r.get("expanded_chunks", 1),
+                "merged_ranges": r.get("merged_ranges", 1),
                 "text_len": len(r.get("text", "") or ""),
             }
             for r in expanded[:5]
@@ -891,15 +938,7 @@ class DomainQueryEngine:
             reranked = _field_match_rerank(reranked, query, bm25)
         # Always filter obvious noise regardless of query type.
         reranked = _drop_obvious_noise(reranked, query)
-        # Deduplicate by source_file
-        seen_sources: set[str] = set()
-        deduped: list[dict] = []
-        for r in reranked:
-            src = r.get("source_file", "")
-            if src not in seen_sources:
-                seen_sources.add(src)
-                deduped.append(r)
-        reranked = deduped[:top_k]
+        reranked = reranked[:top_k * 3]
         self._log_stage("rerank", reranked)
         if trace:
             trace["rerank"] = self._snapshot_stage(reranked)
