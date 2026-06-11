@@ -463,6 +463,81 @@ def _chunk_lookup(chunks: list) -> tuple[dict[tuple, dict], dict[str, list[dict]
     return by_key, by_source
 
 
+# ── 扩展用 chunk 缓存（进程级，按 source_file 缓存） ──
+_EXPAND_CHUNKS_CACHE: Dict[str, tuple[float, list]] = {}
+_EXPAND_CHUNKS_TTL = 300  # 5 分钟刷新一次
+
+
+def _load_chunks_for_source(cfg: Dict[str, Any], source_file: str) -> list:
+    """从 Qdrant 按 source_file 过滤加载 chunk，用于上下文扩展。
+
+    只拉取命中文档的 chunk，不加载全量数据。
+    带进程级缓存（5 分钟 TTL）。
+    """
+    cache_key = f"{cfg.get('domain', '')}:{source_file}"
+    now = time.time()
+
+    cached = _EXPAND_CHUNKS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _EXPAND_CHUNKS_TTL:
+        return cached[1]
+
+    collection = cfg["collection"]
+    host = cfg.get("qdrant_host", "localhost")
+    port = cfg.get("qdrant_port", 6333)
+    url = f"http://{host}:{port}/collections/{collection}/points/scroll"
+    chunks: list = []
+    offset = None
+
+    with httpx.Client(timeout=30.0) as client:
+        while True:
+            body: Dict[str, Any] = {
+                "limit": 4096,
+                "with_payload": True,
+                "with_vector": False,
+                "filter": {
+                    "must": [
+                        {"key": "source_file", "match": {"value": source_file}},
+                    ],
+                },
+            }
+            if offset is not None:
+                body["offset"] = offset
+
+            resp = client.post(url, json=body, headers=_qdrant_headers())
+            resp.raise_for_status()
+            data = resp.json().get("result", {})
+            points = data.get("points", [])
+
+            for point in points:
+                payload = point.get("payload") or {}
+                text = payload.get("text") or ""
+                if not text:
+                    continue
+                chunks.append({
+                    "text": text,
+                    "metadata": {
+                        "domain": payload.get("domain", cfg.get("domain", "")),
+                        "context": payload.get("context", ""),
+                        "source_file": payload.get("source_file", ""),
+                        "chunk_index": payload.get("chunk_index", 0),
+                        "has_code": payload.get("has_code", False),
+                        "category": payload.get("category", ""),
+                    },
+                })
+
+            offset = data.get("next_page_offset")
+            if not offset:
+                break
+
+    # 按 chunk_index 排序
+    chunks.sort(key=lambda c: c["metadata"].get("chunk_index", 0))
+
+    if chunks:
+        _EXPAND_CHUNKS_CACHE[cache_key] = (now, chunks)
+    logger.debug("loaded %d chunks for source_file=%s", len(chunks), source_file)
+    return chunks
+
+
 def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int = 5, max_chars_per_result: int = 12000) -> List[dict]:
     """Expand hits with adjacent chunks, merging overlapping ranges per document.
 
@@ -470,16 +545,11 @@ def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int
     - Groups results by source_file, merges overlapping ±window ranges
     - Avoids duplicate content when topK has adjacent chunks from the same doc
     - Configurable via CODING_RAG_CONTEXT_WINDOW / CODING_RAG_CONTEXT_MAX_CHARS
+    - Loads per-source chunks from Qdrant with payload filter (not full collection)
     """
     import os
     window = int(os.getenv("CODING_RAG_CONTEXT_WINDOW", str(window)))
     max_chars = int(os.getenv("CODING_RAG_CONTEXT_MAX_CHARS", str(max_chars_per_result)))
-
-    _, chunks = _load_keyword_searcher_for_domain(cfg)
-    if not chunks:
-        return results
-
-    by_key, by_source = _chunk_lookup(chunks)
 
     # ── 1. 按 source_file 分组，收集命中的 chunk_index ──
     groups: dict[str, list[dict]] = {}  # source_file -> [result, ...]
@@ -490,29 +560,34 @@ def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int
     expanded: list[dict] = []
 
     for source, group_results in groups.items():
-        source_items = by_source.get(source, [])
-        if not source_items:
-            # 无法定位 chunk，原样返回
+        if not source:
             expanded.extend(group_results)
             continue
 
-        # ── 2. 收集所有命中的 chunk 在 source_items 中的 index ──
+        # 按 source_file 从 Qdrant 加载该文档的全部 chunk（带缓存）
+        source_chunks = _load_chunks_for_source(cfg, source)
+        if not source_chunks:
+            expanded.extend(group_results)
+            continue
+
+        # ── 2. 收集所有命中的 chunk_index，在 source_chunks 中定位 ──
         hit_indices: set[int] = set()
-        best_r = group_results[0]  # 保留得分最高的作为主 result
+        best_r = group_results[0]
         for r in group_results:
             chunk_idx = r.get("chunk_index")
-            item = by_key.get((source, chunk_idx)) if chunk_idx is not None else None
-            if item is None:
-                # fallback: 按 context 匹配
-                for candidate in source_items:
-                    meta = candidate["record"].get("metadata", {}) or {}
-                    if meta.get("context", "") == r.get("context", ""):
-                        item = candidate
+            # 按 chunk_index 精确匹配
+            if chunk_idx is not None:
+                for i, sc in enumerate(source_chunks):
+                    if sc["metadata"].get("chunk_index") == chunk_idx:
+                        hit_indices.add(i)
                         break
-            if item is not None:
-                center_i = next((i for i, c in enumerate(source_items) if c is item), -1)
-                if center_i >= 0:
-                    hit_indices.add(center_i)
+            else:
+                # fallback: 按 context 匹配
+                ctx = r.get("context", "")
+                for i, sc in enumerate(source_chunks):
+                    if sc["metadata"].get("context", "") == ctx:
+                        hit_indices.add(i)
+                        break
             # 更新 best_r（取 score 最高的）
             if float(r.get("score", 0) or 0) > float(best_r.get("score", 0) or 0):
                 best_r = r
@@ -525,7 +600,7 @@ def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int
         ranges: list[tuple[int, int]] = []
         for idx in sorted(hit_indices):
             lo = max(0, idx - window)
-            hi = min(len(source_items) - 1, idx + window)
+            hi = min(len(source_chunks) - 1, idx + window)
             ranges.append((lo, hi))
 
         # ── 4. 合并重叠区间 ──
@@ -543,7 +618,7 @@ def _expand_result_context(results: List[dict], cfg: Dict[str, Any], window: int
         total = 0
         for lo, hi in merged:
             for i in range(lo, hi + 1):
-                record = source_items[i]["record"]
+                record = source_chunks[i]
                 text = record.get("text", "") or ""
                 meta = record.get("metadata", {}) or {}
                 if not text:
