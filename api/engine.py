@@ -1003,7 +1003,7 @@ class DomainQueryEngine:
         reranked = rerank_results(
             query,
             candidates,
-            top_k=max(top_k * 3, 15),
+            top_k=top_k,
             api_base=self.rerank_api_base,
             model_name=self.rerank_model_name,
         )
@@ -1013,7 +1013,7 @@ class DomainQueryEngine:
             reranked = _field_match_rerank(reranked, query, bm25)
         # Always filter obvious noise regardless of query type.
         reranked = _drop_obvious_noise(reranked, query)
-        reranked = reranked[:top_k * 3]
+        reranked = reranked[:top_k]
         self._log_stage("rerank", reranked)
         if trace:
             trace["rerank"] = self._snapshot_stage(reranked)

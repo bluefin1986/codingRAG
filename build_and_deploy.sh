@@ -84,7 +84,7 @@ set tar_name $env(TAR_NAME)
 set remote $env(REMOTE)
 set auth_count 0
 
-spawn rsync -avP $tar_name $remote
+spawn scp $tar_name $remote
 
 expect {
   -re "(?i).*are you sure you want to continue connecting.*" {
