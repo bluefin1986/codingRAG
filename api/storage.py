@@ -90,12 +90,14 @@ class SeaweedFSObjectStorage(ObjectStorage):
         public_base_url: str = "",
         key_prefix: str = "libraries",
         timeout_seconds: float = 120.0,
+        content_addressed_paths: bool = False,
     ) -> None:
         self.filer_url = filer_url.rstrip("/")
         self.public_base_url = (public_base_url or filer_url).rstrip("/")
         self.bucket = _safe_path_segment(bucket.strip() or "codingrag-originals")
         self.key_prefix = _clean_key_prefix(key_prefix or "libraries")
         self.timeout_seconds = timeout_seconds
+        self.content_addressed_paths = content_addressed_paths
         self._local = LocalObjectStorage()
 
     def put_existing_file(self, path: Path, *, relative_path: str) -> StoredObject:
@@ -179,6 +181,8 @@ class SeaweedFSObjectStorage(ObjectStorage):
 
     def _object_key(self, *, relative_path: str, digest: str) -> str:
         normalized_relative = "/".join(_safe_path_segment(part) for part in Path(relative_path).as_posix().split("/") if part)
+        if self.content_addressed_paths:
+            return "/".join(part for part in (self.bucket, self.key_prefix, normalized_relative) if part)
         return "/".join(part for part in (self.bucket, self.key_prefix, digest[:2], digest[:12], normalized_relative) if part)
 
     def _remote_url(self, storage_path: str, storage_key: str | None) -> str | None:
@@ -245,6 +249,7 @@ def create_storage(
     seaweedfs_public_base_url: str = "",
     seaweedfs_bucket: str = "",
     seaweedfs_key_prefix: str = "",
+    content_addressed_paths: bool = False,
 ) -> ObjectStorage:
     normalized = (backend or "local").strip().lower()
     if normalized in {"seaweedfs", "seaweed", "weed"}:
@@ -253,5 +258,6 @@ def create_storage(
             public_base_url=seaweedfs_public_base_url or os.getenv("CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL", ""),
             bucket=seaweedfs_bucket or os.getenv("CODING_RAG_SEAWEEDFS_BUCKET", "codingrag-originals"),
             key_prefix=seaweedfs_key_prefix or os.getenv("CODING_RAG_SEAWEEDFS_KEY_PREFIX", "libraries"),
+            content_addressed_paths=content_addressed_paths,
         )
     return LocalObjectStorage()

@@ -14,6 +14,7 @@
                 "8060",
                 "--reload"
             ],
+            "python": "${workspaceFolder}/.venv/bin/python",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env.debug",
             "console": "integratedTerminal",
@@ -24,6 +25,18 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/library_import_worker.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env.debug",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "codingRAG reindex worker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/reindex_worker.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env.debug",
             "console": "integratedTerminal",
@@ -44,7 +57,8 @@
             "name": "codingRAG API + ingest worker",
             "configurations": [
                 "codingRAG API",
-                "codingRAG ingest worker"
+                "codingRAG ingest worker",
+                "codingRAG reindex worker"
             ],
             "stopAll": true
         }

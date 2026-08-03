@@ -31,6 +31,19 @@ class _Client:
 
 
 class StorageDeleteTest(unittest.TestCase):
+    def test_content_addressed_assets_do_not_add_source_or_digest_path_segments(self) -> None:
+        digest = "93682ff4206ed406425f8b332ed9103919aa5bd3fe820d4e50ac64161f09c298"
+        storage = SeaweedFSObjectStorage(
+            "http://filer:8888",
+            bucket="codingrag-assets",
+            key_prefix="markdown-assets",
+            content_addressed_paths=True,
+        )
+
+        key = storage._object_key(relative_path=f"{digest}.png", digest=digest)
+
+        self.assertEqual(key, f"codingrag-assets/markdown-assets/{digest}.png")
+
     def test_local_delete_removes_existing_original(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "guide.md"

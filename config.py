@@ -36,6 +36,12 @@ CODING_RAG_SEAWEEDFS_BUCKET = os.getenv("CODING_RAG_SEAWEEDFS_BUCKET", "codingra
 CODING_RAG_SEAWEEDFS_KEY_PREFIX = os.getenv("CODING_RAG_SEAWEEDFS_KEY_PREFIX", "libraries").strip().strip("/")
 CODING_RAG_SEAWEEDFS_S3_ENDPOINT = os.getenv("CODING_RAG_SEAWEEDFS_S3_ENDPOINT", "").strip().rstrip("/")
 CODING_RAG_IMPORT_BATCH_SIZE = int(os.getenv("CODING_RAG_IMPORT_BATCH_SIZE", "100"))
+# Markdown image assets may use an internal filer address for uploads and a
+# distinct browser-facing hostname for URLs written into imported Markdown.
+CODING_RAG_ASSET_UPLOAD_BASE_URL = os.getenv("CODING_RAG_ASSET_UPLOAD_BASE_URL", CODING_RAG_SEAWEEDFS_FILER_URL).strip().rstrip("/")
+CODING_RAG_ASSET_PUBLIC_BASE_URL = os.getenv("CODING_RAG_ASSET_PUBLIC_BASE_URL", CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL).strip().rstrip("/")
+CODING_RAG_ASSET_BUCKET = os.getenv("CODING_RAG_ASSET_BUCKET", "codingrag-assets").strip()
+CODING_RAG_ASSET_KEY_PREFIX = os.getenv("CODING_RAG_ASSET_KEY_PREFIX", "markdown-assets").strip().strip("/")
 
 # ── Elasticsearch / OpenSearch ──
 CODING_RAG_ES_URL = os.getenv("CODING_RAG_ES_URL", "").strip().rstrip("/")

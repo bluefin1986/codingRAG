@@ -30,26 +30,32 @@ REMOTE="${REMOTE:-codingRAG126_rag:/data/rag/container/}"
 PASS1="${RSYNC_PASS1:?请设置 RSYNC_PASS1}"
 PASS2="${RSYNC_PASS2:?请设置 RSYNC_PASS2}"
 
-# 主 app 镜像名
-CODINGRAG_IMAGE="${CODINGRAG_IMAGE:-codingrag:latest}"
+# The app and workers are built from the same Dockerfile but use separate image
+# tags. Ship all three exact references so the remote docker-compose only needs
+# `docker load`, never a registry pull or a source-tree build.
+CODINGRAG_VERSION="${CODINGRAG_VERSION:?请设置 CODINGRAG_VERSION}"
+CODINGRAG_APP_IMAGE_REF="${CODINGRAG_IMAGE:-codingrag}:${CODINGRAG_VERSION}"
+CODINGRAG_IMPORT_WORKER_IMAGE_REF="${CODINGRAG_IMPORT_WORKER_IMAGE:-codingrag-library-import-worker}:${CODINGRAG_VERSION}"
+CODINGRAG_REINDEX_WORKER_IMAGE_REF="${CODINGRAG_REINDEX_WORKER_IMAGE:-codingrag-reindex-worker}:${CODINGRAG_VERSION}"
 
 if [ "$FULL_DEPLOY" = true ]; then
   echo "==> 完整部署模式（包含中间件）"
-  echo "==> docker compose build (all)"
+  echo "==> 本机 docker compose build (all)"
   docker compose -f "$COMPOSE_FILE" build
   
-  echo "==> 获取所有 compose 镜像"
+  echo "==> 本机获取所有 compose 镜像"
   IMAGES=()
   while IFS= read -r image; do
     [ -n "$image" ] && IMAGES+=("$image")
   done < <(docker compose -f "$COMPOSE_FILE" config --images | sort -u)
 else
   echo "==> 快速部署模式（只部署主 app）"
-  echo "==> docker compose build app"
+  echo "==> 本机 docker compose build app + workers"
   docker compose -f "$COMPOSE_FILE" build app library-import-worker reindex-worker
   
-  # 只保存主 app 镜像
-  IMAGES=("$CODINGRAG_IMAGE")
+  # App and both workers use distinct Compose image tags; all must be loaded on
+  # the remote host before legacy docker-compose starts the services.
+  IMAGES=("$CODINGRAG_APP_IMAGE_REF" "$CODINGRAG_IMPORT_WORKER_IMAGE_REF" "$CODINGRAG_REINDEX_WORKER_IMAGE_REF")
 fi
 
 if [ "${#IMAGES[@]}" -eq 0 ]; then
@@ -108,10 +114,10 @@ echo "==> ssh 到 $REMOTE_HOST 执行 docker load 和 docker-compose up"
 
 if [ "$FULL_DEPLOY" = true ]; then
   # 完整部署：force-recreate 所有服务
-  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker-compose up -d --force-recreate"
+  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker image inspect '$CODINGRAG_APP_IMAGE_REF' '$CODINGRAG_IMPORT_WORKER_IMAGE_REF' '$CODINGRAG_REINDEX_WORKER_IMAGE_REF' >/dev/null && docker-compose up -d --no-build --force-recreate"
 else
   # 快速部署：只重启主 app 服务
-  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker-compose up -d --force-recreate app library-import-worker reindex-worker"
+  DEPLOY_CMD="cd '$DEPLOY_DIR' && docker load < '$REMOTE_TAR_PATH' && docker image inspect '$CODINGRAG_APP_IMAGE_REF' '$CODINGRAG_IMPORT_WORKER_IMAGE_REF' '$CODINGRAG_REINDEX_WORKER_IMAGE_REF' >/dev/null && docker-compose up -d --no-build --force-recreate app library-import-worker reindex-worker"
 fi
 
 PASS1="$PASS1" PASS2="$PASS2" REMOTE_HOST="$REMOTE_HOST" DEPLOY_CMD="$DEPLOY_CMD" /usr/bin/expect <<EOF

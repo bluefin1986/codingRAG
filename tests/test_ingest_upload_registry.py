@@ -129,6 +129,20 @@ class UploadIngestRegistryTest(unittest.TestCase):
             self.assertEqual([item["relative_path"] for item in staged["items"]], ["docs/guide.md"])
             self.assertEqual(registry.complete_ingest_upload("job-1")["status"], "pending")
 
+    def test_image_asset_is_staged_without_becoming_a_document_item(self) -> None:
+        registry = _UploadRegistry()
+        with TemporaryDirectory() as directory, patch.object(
+            registry_module, "INGEST_STAGING_ROOT", Path(directory)
+        ):
+            result = registry.stage_ingest_files(
+                "job-1",
+                [("markdown/guide.md", b"![diagram](../assets/diagram.png)"), ("assets/diagram.png", b"png")],
+            )
+
+            staged_root = Path(directory) / "job-1" / "uploads"
+            self.assertEqual([item["relative_path"] for item in result["items"]], ["markdown/guide.md"])
+            self.assertEqual((staged_root / "assets/diagram.png").read_bytes(), b"png")
+
     def test_hidden_looking_traversal_is_still_rejected(self) -> None:
         registry = _UploadRegistry()
         with self.assertRaisesRegex(ValueError, "unsafe relative_path"):

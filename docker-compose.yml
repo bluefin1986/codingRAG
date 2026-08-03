@@ -8,7 +8,7 @@ services:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
         NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
-    image: ${CODINGRAG_IMAGE:-codingrag:latest}
+    image: ${CODINGRAG_IMAGE:-codingrag}:${CODINGRAG_VERSION:?CODINGRAG_VERSION is required}
     container_name: ${CODINGRAG_CONTAINER_NAME:-codingrag-app}
     ports:
       - "${CODINGRAG_HTTP_PORT:-8060}:8060"
@@ -29,6 +29,10 @@ services:
       CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL: ${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}
       CODING_RAG_SEAWEEDFS_BUCKET: ${CODING_RAG_SEAWEEDFS_BUCKET:-codingrag-originals}
       CODING_RAG_SEAWEEDFS_KEY_PREFIX: ${CODING_RAG_SEAWEEDFS_KEY_PREFIX:-libraries}
+      CODING_RAG_ASSET_UPLOAD_BASE_URL: ${CODING_RAG_ASSET_UPLOAD_BASE_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_ASSET_PUBLIC_BASE_URL: ${CODING_RAG_ASSET_PUBLIC_BASE_URL:-${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}}
+      CODING_RAG_ASSET_BUCKET: ${CODING_RAG_ASSET_BUCKET:-codingrag-assets}
+      CODING_RAG_ASSET_KEY_PREFIX: ${CODING_RAG_ASSET_KEY_PREFIX:-markdown-assets}
       CODING_RAG_SEAWEEDFS_S3_ENDPOINT: ${CODING_RAG_SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs-filer:8333}
       CODING_RAG_IMPORT_BATCH_SIZE: ${CODING_RAG_IMPORT_BATCH_SIZE:-100}
       CODING_RAG_DOCREADER_ADDR: ${CODING_RAG_DOCREADER_ADDR:-127.0.0.1:50051}
@@ -51,7 +55,7 @@ services:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
         NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
-    image: ${CODINGRAG_IMPORT_WORKER_IMAGE:-codingrag-library-import-worker:latest}
+    image: ${CODINGRAG_IMPORT_WORKER_IMAGE:-codingrag-library-import-worker}:${CODINGRAG_VERSION:?CODINGRAG_VERSION is required}
     container_name: ${CODINGRAG_IMPORT_WORKER_CONTAINER_NAME:-codingrag-library-import-worker}
     command: python3 scripts/library_import_worker.py
     environment:
@@ -61,6 +65,10 @@ services:
       CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL: ${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}
       CODING_RAG_SEAWEEDFS_BUCKET: ${CODING_RAG_SEAWEEDFS_BUCKET:-codingrag-originals}
       CODING_RAG_SEAWEEDFS_KEY_PREFIX: ${CODING_RAG_SEAWEEDFS_KEY_PREFIX:-libraries}
+      CODING_RAG_ASSET_UPLOAD_BASE_URL: ${CODING_RAG_ASSET_UPLOAD_BASE_URL:-http://seaweedfs-filer:8888}
+      CODING_RAG_ASSET_PUBLIC_BASE_URL: ${CODING_RAG_ASSET_PUBLIC_BASE_URL:-${CODING_RAG_SEAWEEDFS_PUBLIC_BASE_URL:-http://seaweedfs-filer:8888}}
+      CODING_RAG_ASSET_BUCKET: ${CODING_RAG_ASSET_BUCKET:-codingrag-assets}
+      CODING_RAG_ASSET_KEY_PREFIX: ${CODING_RAG_ASSET_KEY_PREFIX:-markdown-assets}
       CODING_RAG_SEAWEEDFS_S3_ENDPOINT: ${CODING_RAG_SEAWEEDFS_S3_ENDPOINT:-http://seaweedfs-filer:8333}
       CODING_RAG_IMPORT_BATCH_SIZE: ${CODING_RAG_IMPORT_BATCH_SIZE:-100}
     depends_on:
@@ -79,7 +87,7 @@ services:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-${HTTP_PROXY:-}}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-${HTTPS_PROXY:-}}
         NO_PROXY: ${BUILD_NO_PROXY:-${NO_PROXY:-}}
-    image: ${CODINGRAG_REINDEX_WORKER_IMAGE:-codingrag-reindex-worker:latest}
+    image: ${CODINGRAG_REINDEX_WORKER_IMAGE:-codingrag-reindex-worker}:${CODINGRAG_VERSION:?CODINGRAG_VERSION is required}
     container_name: ${CODINGRAG_REINDEX_WORKER_CONTAINER_NAME:-codingrag-reindex-worker}
     command: python3 scripts/reindex_worker.py
     environment:

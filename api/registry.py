@@ -22,6 +22,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from config import (
+    CODING_RAG_ASSET_BUCKET,
+    CODING_RAG_ASSET_KEY_PREFIX,
+    CODING_RAG_ASSET_PUBLIC_BASE_URL,
+    CODING_RAG_ASSET_UPLOAD_BASE_URL,
     CODING_RAG_DATABASE_URL,
     CODING_RAG_IMPORT_BATCH_SIZE,
     CODING_RAG_SEAWEEDFS_BUCKET,
@@ -31,6 +35,7 @@ from config import (
     CODING_RAG_STORAGE_BACKEND,
     get_domain_config,
 )
+from api.markdown_assets import asset_storage_relative_path, rewrite_local_markdown_images
 from api.storage import create_storage
 from api.docreader.client import (
     DOCREADER_EXTENSIONS,
@@ -41,6 +46,7 @@ from api.docreader.client import (
 TEXT_EXTENSIONS = {".md", ".markdown", ".mdx", ".txt", ".html", ".htm", ".rst"}
 # 所有支持的扩展名（文本 + DocReader 可转换的）
 ALL_SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | DOCREADER_EXTENSIONS
+ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 DEFAULT_RETENTION_VERSIONS = 2
 INGEST_STAGING_ROOT = Path(__file__).resolve().parents[1] / "output" / "ingest-jobs"
 logger = logging.getLogger(__name__)
@@ -794,7 +800,7 @@ class DocumentRegistry:
             if rel in seen:
                 raise ValueError(f"duplicate relative_path in upload: {rel}")
             ext = Path(rel).suffix.lower()
-            if ext not in ALL_SUPPORTED_EXTENSIONS:
+            if ext not in ALL_SUPPORTED_EXTENSIONS | ASSET_EXTENSIONS:
                 raise ValueError(f"unsupported document extension: {rel}")
             # 非文本文件：通过 DocReader 转换为 Markdown
             if ext in DOCREADER_EXTENSIONS:
@@ -843,6 +849,8 @@ class DocumentRegistry:
                 target.write_bytes(content)
                 staged_rows.append((relative_path, target, len(content)))
             for relative_path, target, content_length in staged_rows:
+                if Path(relative_path).suffix.lower() in ASSET_EXTENSIONS:
+                    continue
                 cur.execute(
                     """
                     INSERT INTO knowledge_ingest_items (
@@ -1327,6 +1335,29 @@ class DocumentRegistry:
             seaweedfs_bucket=CODING_RAG_SEAWEEDFS_BUCKET,
             seaweedfs_key_prefix=CODING_RAG_SEAWEEDFS_KEY_PREFIX,
         )
+        asset_storage = create_storage(
+            CODING_RAG_STORAGE_BACKEND,
+            seaweedfs_filer_url=CODING_RAG_ASSET_UPLOAD_BASE_URL,
+            seaweedfs_public_base_url=CODING_RAG_ASSET_PUBLIC_BASE_URL,
+            seaweedfs_bucket=CODING_RAG_ASSET_BUCKET,
+            seaweedfs_key_prefix=CODING_RAG_ASSET_KEY_PREFIX,
+            content_addressed_paths=True,
+        )
+        asset_urls: dict[Path, str] = {}
+        staging_root = (INGEST_STAGING_ROOT / job_id / "uploads").resolve()
+
+        def upload_asset(path: Path) -> str:
+            resolved = path.resolve()
+            if resolved not in asset_urls:
+                stored_asset = asset_storage.put_existing_file(
+                    resolved,
+                    relative_path=asset_storage_relative_path(resolved),
+                )
+                if stored_asset.storage_status != "active" or not stored_asset.storage_path.startswith(("http://", "https://")):
+                    raise ValueError(f"asset upload is unavailable for {resolved.name}")
+                asset_urls[resolved] = stored_asset.storage_path
+            return asset_urls[resolved]
+
         while True:
             with self._connect() as conn, conn.cursor() as cur:
                 cur.execute("SELECT status, domain, library_id FROM knowledge_ingest_jobs WHERE id = %s", [job_id])
@@ -1354,6 +1385,9 @@ class DocumentRegistry:
                     if not path.is_file():
                         raise FileNotFoundError(str(path))
                     relative_path = validate_ingest_relative_path(item["relative_path"])
+                    if path.suffix.lower() in {".md", ".markdown", ".mdx"}:
+                        rewrite = rewrite_local_markdown_images(path, staging_root, upload_asset)
+                        path.write_text(rewrite.content, encoding="utf-8")
                     metadata = inspect_ingest_document(path, relative_path, job["domain"], cfg)
                     with self._connect() as conn, conn.cursor() as cur:
                         # Use parent -> item lock order consistently with
